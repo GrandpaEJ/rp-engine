@@ -59,6 +59,38 @@ World Town additionally needs **all** of:
    individually optional — a missing section disables just that path).
 6. `WORLD_TOWN_DISABLED` is not set.
 
+## Worldview
+
+Every world runs inside a per-owner **worldview** — a free-text setting
+document (sci-fi, modern, ancient, …) stored in `engine.world_worldviews`
+(`owner_uid` PK, `content` 1..=10000 chars, `updated_at`). Like
+`world_enrollments`, the table is **downstream-managed**: the engine only
+ever SELECTs it; downstream INSERTs/UPDATEs/DELETEs rows over the
+service_role/owner connection. **The engine ships no default worldview** —
+providing one (a deployment default, or forcing the user to write their own)
+is entirely the downstream's job.
+
+Semantics:
+
+- **Missing/blank worldview = no World System LLM activity.** An enrolled
+  owner without a usable worldview is excluded from WM director rounds,
+  story rounds, and town comment/reply scans; the world sweeper logs one
+  aggregate warn per tick while any such owner exists. Backfilling the
+  table self-heals on the next tick.
+- **Change = reset.** The engine stores the SHA-256 of the content each
+  round (`world_states.worldview_hash`). A changed worldview makes the
+  owner due within one tick and turns the next round into an init-style
+  reset: fresh seed, purged script fragments, purged story data
+  (insights/events/memories), purged *unpublished* posts. Published posts
+  and their comments are kept as read-only feed history, but AI activity
+  (comment rounds, replies) only ever targets posts published after the
+  current era start (`world_states.worldview_set_at`).
+- **Payloads.** The WM director, stories director, and town comment/reply
+  payloads all carry the worldview verbatim plus a fixed rule binding all
+  settings (era, technology, places, occupations, events) to it. The chat
+  prompt is unchanged — chat inherits the worldview through script
+  fragments only.
+
 ## World Memories
 
 ### The director round
@@ -300,7 +332,8 @@ while its feature is switched off.
 | Table | Written by | Holds |
 |-------|-----------|-------|
 | `engine.world_enrollments` | downstream | opt-in rows + `town_enabled` + `stories_enabled` flags |
-| `engine.world_states` | engine | seed, digests, director + comment-round scheduling state |
+| `engine.world_worldviews` | downstream | per-owner worldview text (`owner_uid` PK, `content` 1..=10000 chars, `updated_at`) |
+| `engine.world_states` | engine | seed, digests, director + comment-round scheduling state, `worldview_hash` (SHA-256 of the content used last round) + `worldview_set_at` (current era start, gates Town AI activity) |
 | `engine.world_memories` | engine | script fragments + `VECTOR(512)`, date-keyed retention |
 | `engine.world_posts` | engine | scheduled/published posts, reply-cooldown + last-user-comment stamps |
 | `engine.world_post_comments` | engine + user route | threads; `author_instance_id IS NULL` = the user |
@@ -310,7 +343,7 @@ while its feature is switched off.
 
 `stories_enabled` (migration 0038) is downstream-written on the same
 `world_enrollments` row as `town_enabled` — identical opt-in contract. All
-eight tables get the 0013 lockdown treatment (REVOKE from Supabase browser
+nine tables get the 0013 lockdown treatment (REVOKE from Supabase browser
 roles + policy-less RLS). Unenrolling (or flipping a flag off) stops
 simulation and injection immediately but keeps accumulated data —
 re-enrolling resumes the same world/life.
@@ -323,10 +356,13 @@ the shared world sentinel user `11111111-1111-1111-1111-111111111112`;
 `11111111-1111-1111-1111-111111111113` (dreaming = `…111`, world = `…112`,
 stories = `…113` — per-subsystem spend attribution; see
 [LLM / OpenRouter audit](llm-audit.md)). Steady-state cost per enrolled owner
-per day is bounded by: 1 director call + at most `24h/round_secs` comment
-rounds (only those with activity) + at most `daily_cap` replies + up to
-`24h/interval_hours` story calls per **actively-chatted** instance — and a
-world nobody touches still costs exactly one director call.
+**with a worldview** per day is bounded by: 1 director call + at most
+`24h/round_secs` comment rounds (only those with activity) + at most
+`daily_cap` replies + up to `24h/interval_hours` story calls per
+**actively-chatted** instance — and a world nobody touches still costs
+exactly one director call. An enrolled owner **without** a usable worldview
+costs zero LLM calls — excluded entirely from WM director rounds, story
+rounds, and town scans until downstream backfills `engine.world_worldviews`.
 
 ## Current limits
 
@@ -345,3 +381,4 @@ Design documents (decision history and full edge-case tables):
 - [`docs/superpowers/specs/2026-07-21-world-memories-design.md`](superpowers/specs/2026-07-21-world-memories-design.md)
 - [`docs/superpowers/specs/2026-07-21-world-town-design.md`](superpowers/specs/2026-07-21-world-town-design.md)
 - [`docs/superpowers/specs/2026-07-23-world-stories-design.md`](superpowers/specs/2026-07-23-world-stories-design.md)
+- [`docs/superpowers/specs/2026-07-28-world-worldview-design.md`](superpowers/specs/2026-07-28-world-worldview-design.md)
