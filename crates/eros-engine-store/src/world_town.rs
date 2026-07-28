@@ -90,6 +90,38 @@ impl<'a> WorldTownRepo<'a> {
         .await
     }
 
+    /// Posts fed to a comment round: same shape as `feed_page` but
+    /// restricted to the current worldview era (posts published at/after
+    /// `world_states.worldview_set_at`). Old-era posts stay user-visible
+    /// history but receive no new AI activity (spec §5). A NULL era (no
+    /// worldview round yet) yields no posts — AI activity waits for the
+    /// first reset round.
+    pub async fn round_posts(
+        &self,
+        owner_uid: Uuid,
+        limit: i64,
+    ) -> Result<Vec<FeedPost>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT p.id AS post_id, p.instance_id, pg.name AS author_name, \
+                    p.content, p.published_at \
+             FROM engine.world_posts p \
+             JOIN engine.world_enrollments we \
+               ON we.owner_uid = p.owner_uid AND we.town_enabled \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+             JOIN engine.persona_instances pi ON pi.id = p.instance_id \
+             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             WHERE p.owner_uid = $1 AND p.published_at IS NOT NULL \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at \
+             ORDER BY p.published_at DESC, p.id DESC \
+             LIMIT $2",
+        )
+        .bind(owner_uid)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
     /// All comments for a page of posts, thread order (spec §4: threads are
     /// small by construction; no comment pagination in v1).
     pub async fn list_comments_for_posts(
@@ -150,7 +182,9 @@ impl<'a> WorldTownRepo<'a> {
         sqlx::query_scalar(
             "SELECT ws.owner_uid FROM engine.world_states ws \
              JOIN engine.world_enrollments we USING (owner_uid) \
+             JOIN engine.world_worldviews ww USING (owner_uid) \
              WHERE we.town_enabled \
+               AND btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                AND (ws.last_comment_round_at IS NULL \
                     OR ws.last_comment_round_at < now() - make_interval(secs => $1))",
         )
@@ -208,8 +242,14 @@ impl<'a> WorldTownRepo<'a> {
 
     /// Insert one hourly-round persona comment with validation folded into
     /// the INSERT (spec §3.2): post belongs to the owner and is published,
-    /// author is one of the owner's ACTIVE instances, and the round path
-    /// never self-replies. `false` = rejected (caller warns + drops).
+    /// author is one of the owner's ACTIVE instances, the round path never
+    /// self-replies, and (P2 fix) the post's era is revalidated at insert
+    /// time — `p.published_at >= ws.worldview_set_at` — so a worldview reset
+    /// that commits while this round's LLM call was in flight can't land
+    /// fresh AI content on a now-pre-era post; `round_posts` already fed the
+    /// round from the era current at fetch time, but the era can move
+    /// between that fetch and this INSERT. `false` = rejected (caller warns
+    /// + drops).
     pub async fn insert_round_comment(
         &self,
         owner_uid: Uuid,
@@ -224,8 +264,11 @@ impl<'a> WorldTownRepo<'a> {
              FROM engine.world_posts p \
              JOIN engine.persona_instances pi \
                ON pi.id = $3 AND pi.owner_uid = p.owner_uid AND pi.status = 'active' \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
              WHERE p.id = $1 AND p.owner_uid = $2 \
-               AND p.published_at IS NOT NULL AND p.instance_id <> $3",
+               AND p.published_at IS NOT NULL AND p.instance_id <> $3 \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at",
         )
         .bind(post_id)
         .bind(owner_uid)
@@ -267,10 +310,15 @@ impl<'a> WorldTownRepo<'a> {
                    ON we.owner_uid = p.owner_uid AND we.town_enabled \
                  JOIN engine.persona_instances pi \
                    ON pi.id = p.instance_id AND pi.status = 'active' \
+                 JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+                 JOIN engine.world_worldviews ww \
+                   ON ww.owner_uid = p.owner_uid AND btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                  WHERE p.last_user_comment_at > now() - make_interval(secs => $1) \
                    AND p.last_user_comment_at <= now() - make_interval(secs => $2) \
                    AND (p.last_reply_at IS NULL \
                         OR p.last_reply_at < now() - make_interval(secs => $3)) \
+                   AND ws.worldview_set_at IS NOT NULL \
+                   AND p.published_at >= ws.worldview_set_at \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM engine.world_post_comments a \
                        WHERE a.post_id = p.id AND a.author_instance_id IS NOT NULL \
@@ -320,25 +368,35 @@ impl<'a> WorldTownRepo<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Insert the responder's comment (source = 'reply'). Validation already
-    /// happened in `list_reply_candidates` + the cooldown CAS.
+    /// Insert the responder's comment (source = 'reply'). Most validation
+    /// already happened in `list_reply_candidates` + the cooldown CAS, but
+    /// (P2 fix) the era is revalidated here too — `p.published_at >=
+    /// ws.worldview_set_at` — because the candidate scan and this insert
+    /// bracket an LLM call: a worldview reset can commit while that call is
+    /// in flight, and without this guard the reply would land on a post
+    /// that is now pre-era. `false` = rejected (caller warns + drops).
     pub async fn insert_reply_comment(
         &self,
         post_id: Uuid,
         author_instance_id: Uuid,
         content: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
             "INSERT INTO engine.world_post_comments \
                  (post_id, author_instance_id, source, content) \
-             VALUES ($1, $2, 'reply', $3)",
+             SELECT p.id, $2, 'reply', $3 \
+             FROM engine.world_posts p \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+             WHERE p.id = $1 AND p.published_at IS NOT NULL \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at",
         )
         .bind(post_id)
         .bind(author_instance_id)
         .bind(content)
         .execute(self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// One post with author name, for the reply-responder payload.
@@ -361,7 +419,12 @@ impl<'a> WorldTownRepo<'a> {
 mod tests {
     use super::*;
 
-    /// genome + instance + world enrollment (town on) + world_states backfill.
+    const T_WINDOW: Duration = Duration::from_secs(3600);
+    const T_DEBOUNCE: Duration = Duration::from_secs(60);
+    const T_COOLDOWN: Duration = Duration::from_secs(600);
+
+    /// genome + instance + world enrollment (town on) + world_states backfill
+    /// + worldview with an era that started yesterday.
     pub(super) async fn seed_town_owner(pool: &PgPool) -> (Uuid, Uuid) {
         let owner = Uuid::new_v4();
         let genome: Uuid = sqlx::query_scalar(
@@ -388,8 +451,15 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO engine.world_states (owner_uid, seed, digests) \
-             VALUES ($1, '{}'::jsonb, '{}'::jsonb)",
+            "INSERT INTO engine.world_states (owner_uid, seed, digests, worldview_set_at) \
+             VALUES ($1, '{}'::jsonb, '{}'::jsonb, now() - interval '1 day')",
+        )
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
         )
         .bind(owner)
         .execute(pool)
@@ -419,6 +489,121 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn town_scans_require_worldview(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        let post = seed_post(&pool, owner, inst, "p", true).await;
+        // Settled user comment: inside the window, past the debounce.
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '2 minutes' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = WorldTownRepo { pool: &pool };
+        let round = Duration::from_secs(3600);
+        assert!(repo
+            .list_round_candidates(round)
+            .await
+            .unwrap()
+            .contains(&owner));
+        assert_eq!(
+            repo.list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        sqlx::query("DELETE FROM engine.world_worldviews WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !repo
+                .list_round_candidates(round)
+                .await
+                .unwrap()
+                .contains(&owner),
+            "no worldview ⇒ no comment rounds"
+        );
+        assert!(
+            repo.list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no worldview ⇒ no replies"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reply_candidates_and_round_posts_stay_inside_the_era(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await; // era started 1 day ago
+                                                          // Pre-era post: published 3 days ago, and its user comment is OLDER
+                                                          // than the new post's — without the era filter, DISTINCT ON
+                                                          // (oldest-first) would pick THIS one, so the assertion below proves
+                                                          // the filter, not tie-breaking luck.
+        let old = seed_post(&pool, owner, inst, "旧纪元贴文", true).await;
+        sqlx::query(
+            "UPDATE engine.world_posts \
+             SET published_at = now() - interval '3 days', \
+                 last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
+        )
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fresh = seed_post(&pool, owner, inst, "新纪元贴文", true).await;
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '2 minutes' \
+             WHERE id = $1",
+        )
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = WorldTownRepo { pool: &pool };
+        let cands = repo
+            .list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].post_id, fresh, "pre-era post gets no AI reply");
+
+        let round_view: Vec<String> = repo
+            .round_posts(owner, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.content.clone())
+            .collect();
+        assert_eq!(round_view, vec!["新纪元贴文".to_string()]);
+        assert_eq!(
+            repo.feed_page(owner, 10, None).await.unwrap().len(),
+            2,
+            "user-facing feed keeps full history"
+        );
+
+        // NULL era (worldview present but no reset round yet) ⇒ AI activity
+        // waits for the first worldview round.
+        sqlx::query("UPDATE engine.world_states SET worldview_set_at = NULL WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.round_posts(owner, 10).await.unwrap().is_empty());
+        assert!(repo
+            .list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[sqlx::test]
@@ -708,7 +893,7 @@ mod tests {
         assert_eq!(cands[0].author_instance_id, inst);
 
         // Persona reply after the user comment clears the candidate.
-        repo.insert_reply_comment(post, inst, "在的").await.unwrap();
+        assert!(repo.insert_reply_comment(post, inst, "在的").await.unwrap());
         assert!(repo
             .list_reply_candidates(window, debounce, cooldown, 10)
             .await
@@ -757,9 +942,10 @@ mod tests {
         // Persona comments (round + reply) must NOT move the stamp.
         repo.insert_round_comment_unchecked_for_test(post, inst, "round", "r")
             .await;
-        repo.insert_reply_comment(post, inst, "reply")
+        assert!(repo
+            .insert_reply_comment(post, inst, "reply")
             .await
-            .unwrap();
+            .unwrap());
         let stamp2: Option<DateTime<Utc>> =
             sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
                 .bind(post)
@@ -838,9 +1024,10 @@ mod tests {
         assert_eq!(repo.count_replies_today(owner).await.unwrap(), 0);
         repo.insert_round_comment_unchecked_for_test(post, inst, "round", "round row")
             .await;
-        repo.insert_reply_comment(post, inst, "reply row")
+        assert!(repo
+            .insert_reply_comment(post, inst, "reply row")
             .await
-            .unwrap();
+            .unwrap());
         // User rows never count either.
         repo.insert_user_comment(owner, post, "user row")
             .await
@@ -1055,6 +1242,91 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a round comment after the user comment suppresses the reply"
+        );
+    }
+
+    /// The P2 fix: both town insert paths revalidate the era at write time,
+    /// not just at candidate-scan time. Simulates a worldview reset landing
+    /// mid-flight (between the scan that picked this post and the insert
+    /// that follows an LLM call) by moving `worldview_set_at` forward past
+    /// the post's `published_at` in between two otherwise-identical calls.
+    #[sqlx::test]
+    async fn town_inserts_reject_pre_era_posts(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await; // era started 1 day ago
+                                                          // A second active persona to author the round comment (the round
+                                                          // path rejects self-replies, so it can't reuse `inst`).
+        let genome: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('Rin','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let commenter: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let post = seed_post(&pool, owner, inst, "hello", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+
+        // Published "now", era started 1 day ago ⇒ inside the era: both
+        // insert paths succeed.
+        assert!(
+            repo.insert_round_comment(owner, post, commenter, "不错")
+                .await
+                .unwrap(),
+            "post inside the era accepts a round comment"
+        );
+        assert!(
+            repo.insert_reply_comment(post, inst, "谢谢").await.unwrap(),
+            "post inside the era accepts a reply"
+        );
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_post_comments WHERE post_id = $1",
+        )
+        .bind(post)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 2);
+
+        // The era rolls forward past the post's published_at — in
+        // production terms, a worldview reset committed while a
+        // comment/reply LLM call for this post was in flight.
+        sqlx::query("UPDATE engine.world_states SET worldview_set_at = now() WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !repo
+                .insert_round_comment(owner, post, commenter, "迟到的评论")
+                .await
+                .unwrap(),
+            "pre-era post must reject a round comment"
+        );
+        assert!(
+            !repo
+                .insert_reply_comment(post, inst, "迟到的回复")
+                .await
+                .unwrap(),
+            "pre-era post must reject a reply"
+        );
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_post_comments WHERE post_id = $1",
+        )
+        .bind(post)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "rejected inserts must not grow the comment count"
         );
     }
 

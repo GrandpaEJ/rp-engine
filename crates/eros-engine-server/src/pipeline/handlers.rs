@@ -2236,6 +2236,13 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO engine.world_states (owner_uid, seed, digests) \
              VALUES ($1, '{}'::jsonb, $2)",
         )
@@ -2260,6 +2267,13 @@ mod tests {
             .await
             .unwrap();
         let (_o, token) = claimed[0];
+        let wv_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM engine.world_worldviews WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         repo.persist_round(
             owner,
             &serde_json::json!({}),
@@ -2272,6 +2286,9 @@ mod tests {
             &[],
             chrono::Utc::now().date_naive(),
             30,
+            "h",
+            false,
+            wv_at,
             token,
         )
         .await
