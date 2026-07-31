@@ -3,7 +3,7 @@
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -129,6 +129,122 @@ impl ModelSpec {
         match self {
             ModelSpec::Fixed(s) => Some(s.as_str()),
             _ => None,
+        }
+    }
+}
+
+/// A task's `filter_prompt`. Accepts three TOML shapes, mirroring `ModelSpec`:
+/// `"xxx"` (plain), `["aaa","bbb"]` (index-keyed variants), or
+/// `{ a = "aaa", b = "bbb" }` (string-keyed variants).
+///
+/// Only `[tasks.chat_image_prompt_compose]` reads variants; every other task —
+/// and every tier block, including the composer's own — must use the plain
+/// shape. Enforced at boot by `ModelConfig::validate_prompt_variants`, because
+/// `TaskConfig` is shared by every `[tasks.*]` section and the type alone
+/// cannot express the restriction.
+///
+/// `BTreeMap` (not `HashMap`) so key ordering in boot-failure messages is
+/// deterministic across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PromptSpec {
+    Plain(String),
+    Indexed(Vec<String>),
+    Keyed(BTreeMap<String, String>),
+}
+
+impl PromptSpec {
+    /// The prompt as a plain string. `None` for the variant shapes — which,
+    /// after `validate_prompt_variants`, only the composer task can hold.
+    /// Callers treat `None` exactly like an absent `filter_prompt`.
+    pub fn as_plain(&self) -> Option<&str> {
+        match self {
+            PromptSpec::Plain(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Pick the variant named by `variant`. `None` ⇒ nothing was selected and
+    /// the caller falls back to its built-in default.
+    ///
+    /// `Plain` ignores `variant` entirely — the string IS the prompt.
+    /// `Indexed` parses `variant` as a `usize` index. `Keyed` looks it up as an
+    /// exact, case-sensitive key (`default` carries no special meaning). Every
+    /// miss in a variant shape — absent, unparseable, out of range, unknown
+    /// key — is `None`.
+    ///
+    /// `raw` is handled by the caller BEFORE this is reached; it never appears
+    /// here.
+    pub fn select(&self, variant: Option<&str>) -> Option<&str> {
+        match self {
+            PromptSpec::Plain(s) => Some(s.as_str()),
+            PromptSpec::Indexed(v) => {
+                let idx: usize = variant?.parse().ok()?;
+                v.get(idx).map(String::as_str)
+            }
+            PromptSpec::Keyed(m) => m.get(variant?).map(String::as_str),
+        }
+    }
+}
+
+/// A task/tier `filter_prompt` as a plain string, or `""`. This is the shape
+/// every non-composer `resolve_*` expects. A variant shape reads as `""`
+/// (i.e. "unset"), so those tasks degrade to "feature off" rather than
+/// misbehaving — a branch `validate_prompt_variants` makes unreachable at boot.
+fn plain_or_empty(spec: Option<&PromptSpec>) -> String {
+    spec.and_then(PromptSpec::as_plain)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Structural rules for a variant-shaped `filter_prompt`. `Plain` always
+/// passes — its blank-string leniency ("commented out" ⇒ built-in default) is
+/// deliberate and unchanged. A variant container is a deliberate list, so a
+/// blank inside it is a typo, and silently substituting the generic built-in
+/// prompt would be the hardest class of misconfiguration to notice.
+fn check_variant_shape(task: &str, spec: &PromptSpec) -> Result<(), String> {
+    let refuse = |why: String| {
+        Err(format!(
+            "[tasks.{task}].filter_prompt {why} — eros-engine refuses to boot."
+        ))
+    };
+    match spec {
+        PromptSpec::Plain(_) => Ok(()),
+        PromptSpec::Indexed(v) => {
+            if v.is_empty() {
+                return refuse("is an empty array".to_string());
+            }
+            match v.iter().position(|s| s.trim().is_empty()) {
+                Some(i) => refuse(format!("has a blank entry at index {i}")),
+                None => Ok(()),
+            }
+        }
+        PromptSpec::Keyed(m) => {
+            if m.is_empty() {
+                return refuse("is an empty table".to_string());
+            }
+            for (k, v) in m {
+                if k.trim().is_empty() {
+                    return refuse("has a blank key".to_string());
+                }
+                if k.trim() != k.as_str() {
+                    return refuse(format!(
+                        "has whitespace-padded key \"{k}\": its trimmed form differs from the raw \
+                         key, but `select` matches a client's `image.prompt_variant` exactly — so \
+                         neither \"{k}\" nor its trimmed form could ever select it"
+                    ));
+                }
+                if k.trim().eq_ignore_ascii_case("raw") {
+                    return refuse(format!(
+                        "uses the reserved key \"{k}\": \"raw\" is the wire value that skips the \
+                         composer entirely, so a prompt stored under it could never be selected"
+                    ));
+                }
+                if v.trim().is_empty() {
+                    return refuse(format!("has a blank value for key \"{k}\""));
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -347,7 +463,7 @@ pub struct TierConfig {
     #[serde(default)]
     pub output_filter: Option<bool>,
     #[serde(default)]
-    pub filter_prompt: Option<String>,
+    pub filter_prompt: Option<PromptSpec>,
     #[serde(default)]
     pub trigger: Option<OutputFilterTrigger>,
     #[serde(default)]
@@ -518,7 +634,7 @@ pub struct TaskConfig {
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
     #[serde(default)]
-    pub filter_prompt: Option<String>,
+    pub filter_prompt: Option<PromptSpec>,
     #[serde(default)]
     pub trigger: Option<OutputFilterTrigger>,
     #[serde(default)]
@@ -1253,9 +1369,16 @@ impl ModelConfig {
 
         // filter_prompt / trigger / timing: tier → default block.
         let filter_prompt = tier_cfg
-            .and_then(|t| t.filter_prompt.clone())
-            .or_else(|| task_cfg.filter_prompt.clone())
-            .unwrap_or_default();
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
+            .or_else(|| {
+                task_cfg
+                    .filter_prompt
+                    .as_ref()
+                    .and_then(PromptSpec::as_plain)
+            })
+            .unwrap_or_default()
+            .to_string();
         if filter_prompt.trim().is_empty() {
             return None; // no usable instruction ⇒ inert
         }
@@ -1327,7 +1450,7 @@ impl ModelConfig {
             return None;
         }
         let task_cfg = self.tasks.get(FILTER_TASK)?;
-        let filter_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let filter_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if filter_prompt.trim().is_empty() {
             return None;
         }
@@ -1355,7 +1478,7 @@ impl ModelConfig {
     pub fn resolve_vision(&self) -> Option<ResolvedVision> {
         const VISION_TASK: &str = "chat_vision";
         let task_cfg = self.tasks.get(VISION_TASK)?;
-        let describe_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let describe_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if describe_prompt.trim().is_empty() {
             return None;
         }
@@ -1390,7 +1513,9 @@ impl ModelConfig {
         let audio_tags = task_cfg.tts_audio_tags.unwrap_or(false);
         let custom = task_cfg
             .filter_prompt
-            .clone()
+            .as_ref()
+            .and_then(PromptSpec::as_plain)
+            .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
         let directive = match (custom, audio_tags) {
             (Some(c), true) => format!("{c}\n\n{AUDIO_TAGS_ADDENDUM}"),
@@ -1435,7 +1560,7 @@ impl ModelConfig {
     pub fn resolve_pde(&self) -> Option<ResolvedPde> {
         const PDE_TASK: &str = "pde_decision";
         let task_cfg = self.tasks.get(PDE_TASK)?;
-        let decision_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let decision_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if decision_prompt.trim().is_empty() {
             return None;
         }
@@ -1463,7 +1588,7 @@ impl ModelConfig {
     pub fn resolve_product_qa(&self) -> Option<ResolvedProductQa> {
         const PRODUCT_QA_TASK: &str = "chat_product_qa";
         let task_cfg = self.tasks.get(PRODUCT_QA_TASK)?;
-        let answer_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let answer_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if answer_prompt.trim().is_empty() {
             return None;
         }
@@ -1491,7 +1616,8 @@ impl ModelConfig {
     pub fn product_qa_enabled(&self) -> bool {
         self.tasks
             .get("chat_product_qa")
-            .and_then(|t| t.filter_prompt.as_deref())
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
             .is_some_and(|p| !p.trim().is_empty())
     }
 
@@ -1502,7 +1628,8 @@ impl ModelConfig {
     pub fn pde_enabled(&self) -> bool {
         self.tasks
             .get("pde_decision")
-            .and_then(|t| t.filter_prompt.as_deref())
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
             .is_some_and(|p| !p.trim().is_empty())
     }
 
@@ -1550,17 +1677,64 @@ impl ModelConfig {
         })
     }
 
-    /// Resolve the image-prompt composer task. `None` (feature off) only when
-    /// `[tasks.chat_image_prompt_compose]` is absent. When the task is present, a
-    /// non-blank `filter_prompt` overrides the built-in `DEFAULT_COMPOSE_PROMPT`;
-    /// a blank/absent one falls back to it. No probability/trigger gate; the
-    /// caller invokes it only after an image action is decided.
-    pub fn resolve_image_prompt_compose(&self) -> Option<ResolvedImagePromptCompose> {
+    /// Resolve the image-prompt composer task. `None` (composer does not run)
+    /// when `[tasks.chat_image_prompt_compose]` is absent, **or** when the
+    /// caller passed the reserved `raw` variant — the two are indistinguishable
+    /// by design, since both mean "use the seed subject verbatim"; `tracing`
+    /// tells them apart.
+    ///
+    /// `variant` is the client's per-turn `image.prompt_variant`, already
+    /// trimmed by the caller. Selection is delegated to `PromptSpec::select`:
+    /// a plain `filter_prompt` ignores it, and any miss in a variant shape
+    /// falls back to the built-in `DEFAULT_COMPOSE_PROMPT`.
+    ///
+    /// No probability/trigger gate; the caller invokes it only after an image
+    /// action is decided.
+    pub fn resolve_image_prompt_compose(
+        &self,
+        variant: Option<&str>,
+    ) -> Option<ResolvedImagePromptCompose> {
         const COMPOSE_TASK: &str = "chat_image_prompt_compose";
+        let variant = variant.map(str::trim).filter(|v| !v.is_empty());
+        if variant.is_some_and(|v| v.eq_ignore_ascii_case("raw")) {
+            tracing::debug!("image-compose: variant \"raw\" — skipping composer");
+            return None;
+        }
         let task_cfg = self.tasks.get(COMPOSE_TASK)?;
-        let compose_prompt = task_cfg
+        let selected = task_cfg
             .filter_prompt
-            .as_deref()
+            .as_ref()
+            .and_then(|s| s.select(variant));
+        // The warn/debug decision is a pure function of (selected, variant,
+        // has a filter_prompt at all) — pulled out of the tracing call so it
+        // can be unit-tested directly, without a tracing subscriber, and so a
+        // refactor that accidentally drops a guard shows up as a plain
+        // assertion failure instead of only a missing log line.
+        // `?` (Debug), not `%` (Display): `variant` is a client-supplied wire
+        // value (`image.prompt_variant`) that nothing on the validation path
+        // bounds — unlike `tier`, which is pattern-and-length checked in
+        // `validate_payload`. Debug escapes/quotes so embedded newlines or
+        // control characters can't smuggle fake log lines, and
+        // `cap_for_log` bounds its length so a pathological value can't blow
+        // up log volume.
+        match compose_variant_log_event(selected, variant, task_cfg.filter_prompt.is_some()) {
+            Some(ComposeVariantLogEvent::Mismatch) => tracing::warn!(
+                variant = ?cap_for_log(variant.unwrap_or_default(), 64),
+                "image-compose: variant not found; using the built-in prompt"
+            ),
+            Some(ComposeVariantLogEvent::Selected) => {
+                tracing::debug!(
+                    variant = ?cap_for_log(variant.unwrap_or_default(), 64),
+                    "image-compose: variant selected"
+                )
+            }
+            None => {}
+        }
+        // `trim`/`is_empty` is what makes a blank PLAIN filter_prompt fall
+        // through to the built-in prompt. Redundant for the variant shapes
+        // (`validate_prompt_variants` rejects blanks there at boot), but
+        // removing it would regress the plain shape.
+        let compose_prompt = selected
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -1585,6 +1759,53 @@ impl ModelConfig {
 fn dedup_keep_first(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Cap a string to at most `max_chars` characters before it reaches a log
+/// line, appending `…` when truncated. Counts/truncates by `char`, never mid
+/// UTF-8 codepoint. Used to bound client-supplied values (e.g. the image
+/// compose `variant`) that no request-validation step already length-limits.
+fn cap_for_log(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// What (if anything) `resolve_image_prompt_compose` should log about a
+/// variant lookup. A `warn` on every miss would fire on the common
+/// no-`prompt_variant`-supplied turn, which is silent by design — only an
+/// explicitly-supplied variant that failed to match is worth surfacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeVariantLogEvent {
+    /// The caller supplied a variant, a `filter_prompt` container exists, and
+    /// nothing matched — falling back to the built-in prompt is surprising
+    /// enough to warn about.
+    Mismatch,
+    /// The caller supplied a variant and something was selected for it
+    /// (worth a breadcrumb at `debug`, not louder).
+    Selected,
+}
+
+/// Pure decision behind the warn/debug logging in
+/// `resolve_image_prompt_compose`, split out so the guard conditions are
+/// unit-testable without a `tracing` subscriber: a refactor that drops the
+/// `variant.is_some()` or `has_filter_prompt` guard changes this function's
+/// return value directly, instead of only silently changing log output.
+fn compose_variant_log_event(
+    selected: Option<&str>,
+    variant: Option<&str>,
+    has_filter_prompt: bool,
+) -> Option<ComposeVariantLogEvent> {
+    if selected.is_none() && variant.is_some() && has_filter_prompt {
+        Some(ComposeVariantLogEvent::Mismatch)
+    } else if selected.is_some() && variant.is_some() {
+        Some(ComposeVariantLogEvent::Selected)
+    } else {
+        None
+    }
 }
 
 /// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
@@ -1643,7 +1864,7 @@ impl ModelConfig {
     /// straight from `resolve()` so the call site keeps today's selection semantics.
     fn resolve_extract(&self, task: &str) -> Option<ResolvedExtract> {
         let task_cfg = self.tasks.get(task)?;
-        let extract_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let extract_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if extract_prompt.trim().is_empty() {
             return None;
         }
@@ -1663,7 +1884,7 @@ impl ModelConfig {
     /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
     pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
         let task_cfg = self.tasks.get("world_director")?;
-        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let director_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if director_prompt.trim().is_empty() {
             return None;
         }
@@ -1690,7 +1911,7 @@ impl ModelConfig {
     /// the comment-round path goes inert.
     pub fn resolve_world_comment(&self) -> Option<ResolvedWorldComment> {
         let task_cfg = self.tasks.get("world_comment")?;
-        let comment_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let comment_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if comment_prompt.trim().is_empty() {
             return None;
         }
@@ -1720,7 +1941,7 @@ impl ModelConfig {
         const MIN_BAND_SECS: u64 = 30;
 
         let task_cfg = self.tasks.get("world_reply")?;
-        let reply_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let reply_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if reply_prompt.trim().is_empty() {
             return None;
         }
@@ -1759,7 +1980,7 @@ impl ModelConfig {
     /// blank — the story claim path goes inert.
     pub fn resolve_world_stories_director(&self) -> Option<ResolvedWorldStories> {
         let task_cfg = self.tasks.get("world_stories_director")?;
-        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let director_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if director_prompt.trim().is_empty() {
             return None;
         }
@@ -1797,6 +2018,55 @@ impl ModelConfig {
                      refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
                      section to disable {name}."
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Boot gate for `filter_prompt` variant shapes. Variants are read by
+    /// `chat_image_prompt_compose` alone, and never from a tier block (the
+    /// composer resolves with `tier = None`), so a variant anywhere else is
+    /// dead config — refuse to boot rather than let it silently no-op.
+    ///
+    /// Also enforces the structural rules for a variant container: non-empty,
+    /// no blank or whitespace-padded keys, no blank values, and no reserved
+    /// `raw` key (`raw` is the wire escape that skips the composer, so a
+    /// config key by that name could never be selected — and a padded key
+    /// like `" a "` could never be selected either, since `select` matches a
+    /// client's variant exactly).
+    ///
+    /// Task names are visited in sorted order so the reported failure is
+    /// deterministic across restarts (`self.tasks` is a `HashMap`).
+    pub fn validate_prompt_variants(&self) -> Result<(), String> {
+        const COMPOSE_TASK: &str = "chat_image_prompt_compose";
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            let task = &self.tasks[name];
+            if let Some(spec) = &task.filter_prompt {
+                if !matches!(spec, PromptSpec::Plain(_)) && name != COMPOSE_TASK {
+                    return Err(format!(
+                        "[tasks.{name}].filter_prompt uses a variant shape (array/table), but \
+                         only [tasks.{COMPOSE_TASK}] reads variants — eros-engine refuses to \
+                         boot. Use a plain string here."
+                    ));
+                }
+                check_variant_shape(name, spec)?;
+            }
+            let mut tier_names: Vec<&String> = task.tiers.keys().collect();
+            tier_names.sort();
+            for tier_name in tier_names {
+                let tier = &task.tiers[tier_name];
+                if let Some(spec) = &tier.filter_prompt {
+                    if !matches!(spec, PromptSpec::Plain(_)) {
+                        return Err(format!(
+                            "[tasks.{name}.tiers.{tier_name}].filter_prompt uses a variant shape \
+                             (array/table), but tier blocks never carry variants — the composer \
+                             resolves with no tier, so it could never be selected. eros-engine \
+                             refuses to boot. Use a plain string here."
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -2268,7 +2538,7 @@ filter_prompt = "Answer product questions from the docs."
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
         assert_eq!(
-            pde.filter_prompt.as_deref(),
+            pde.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
             Some("Decide the action and inner_state.")
         );
         assert_eq!(pde.ghosting, Some(false));
@@ -2280,7 +2550,7 @@ filter_prompt = "Answer product questions from the docs."
         assert_eq!(pq.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert_eq!(pq.retry_depth, Some(1));
         assert_eq!(
-            pq.filter_prompt.as_deref(),
+            pq.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
             Some("Answer product questions from the docs.")
         );
         let rpq = cfg
@@ -2821,7 +3091,10 @@ trigger = { random = 1.0 }
         assert_eq!(cc.tiers["gold"].output_filter, Some(true));
 
         let f = &cfg.tasks["chat_output_filter"];
-        assert_eq!(f.filter_prompt.as_deref(), Some("Rewrite: {x}"));
+        assert_eq!(
+            f.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
+            Some("Rewrite: {x}")
+        );
         assert_eq!(f.retry_depth, Some(2));
         assert_eq!(f.timing, Some(FilterTiming::AfterExtract));
         let trig = f.trigger.clone().unwrap();
@@ -2833,7 +3106,10 @@ trigger = { random = 1.0 }
         // per-tier override parses; tier trigger replaces default wholesale
         assert_eq!(f.tiers["gold"].trigger.clone().unwrap().random, Some(1.0));
         assert_eq!(
-            f.tiers["gold"].filter_prompt.as_deref(),
+            f.tiers["gold"]
+                .filter_prompt
+                .as_ref()
+                .and_then(PromptSpec::as_plain),
             Some("tier prompt")
         );
     }
@@ -4263,7 +4539,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn resolve_image_prompt_compose_none_when_task_absent() {
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
-        assert!(cfg.resolve_image_prompt_compose().is_none());
+        assert!(cfg.resolve_image_prompt_compose(None).is_none());
     }
 
     #[test]
@@ -4274,14 +4550,16 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
         )
         .unwrap();
-        let r = cfg.resolve_image_prompt_compose().unwrap();
+        let r = cfg.resolve_image_prompt_compose(None).unwrap();
         assert_eq!(r.compose_prompt, DEFAULT_COMPOSE_PROMPT);
 
         // also true when filter_prompt is omitted entirely
         let cfg2 = ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
             .unwrap();
         assert_eq!(
-            cfg2.resolve_image_prompt_compose().unwrap().compose_prompt,
+            cfg2.resolve_image_prompt_compose(None)
+                .unwrap()
+                .compose_prompt,
             DEFAULT_COMPOSE_PROMPT
         );
     }
@@ -4293,7 +4571,9 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap();
         assert_eq!(
-            cfg.resolve_image_prompt_compose().unwrap().compose_prompt,
+            cfg.resolve_image_prompt_compose(None)
+                .unwrap()
+                .compose_prompt,
             "custom composer"
         );
     }
@@ -4304,7 +4584,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"compose it\"\nfallback = [\"a\", \"b\", \"c\"]\nretry_depth = 1\n",
         )
         .unwrap();
-        let r = cfg.resolve_image_prompt_compose().unwrap();
+        let r = cfg.resolve_image_prompt_compose(None).unwrap();
         assert_eq!(r.compose_prompt, "compose it");
         assert_eq!(r.retry_depth, 1);
         assert_eq!(r.fallback_model.len(), 1);
@@ -4762,5 +5042,375 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // No stories section at all ⇒ fine either way.
         let cfg = ModelConfig::from_toml_str("").unwrap();
         assert!(cfg.validate_world_prompts(true, true).is_ok());
+    }
+
+    // ─── PromptSpec ──────────────────────────────────────────────────────
+
+    #[derive(Deserialize)]
+    struct SpecWrap {
+        p: PromptSpec,
+    }
+
+    fn spec(src: &str) -> PromptSpec {
+        toml::from_str::<SpecWrap>(src).expect("parse PromptSpec").p
+    }
+
+    #[test]
+    fn prompt_spec_parses_three_shapes() {
+        assert_eq!(spec(r#"p = "xxx""#), PromptSpec::Plain("xxx".into()));
+        assert_eq!(
+            spec(r#"p = ["aaa", "bbb"]"#),
+            PromptSpec::Indexed(vec!["aaa".into(), "bbb".into()])
+        );
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("a".to_string(), "aaa".to_string());
+        m.insert("b".to_string(), "bbb".to_string());
+        assert_eq!(
+            spec(r#"p = { a = "aaa", b = "bbb" }"#),
+            PromptSpec::Keyed(m)
+        );
+    }
+
+    #[test]
+    fn prompt_spec_as_plain_only_for_plain() {
+        assert_eq!(spec(r#"p = "xxx""#).as_plain(), Some("xxx"));
+        assert_eq!(spec(r#"p = ["aaa"]"#).as_plain(), None);
+        assert_eq!(spec(r#"p = { a = "aaa" }"#).as_plain(), None);
+    }
+
+    #[test]
+    fn prompt_spec_plain_ignores_variant() {
+        let s = spec(r#"p = "xxx""#);
+        assert_eq!(s.select(None), Some("xxx"));
+        assert_eq!(s.select(Some("b")), Some("xxx"));
+        assert_eq!(s.select(Some("7")), Some("xxx"));
+    }
+
+    #[test]
+    fn prompt_spec_indexed_selection() {
+        let s = spec(r#"p = ["aaa", "bbb"]"#);
+        assert_eq!(s.select(Some("0")), Some("aaa"));
+        assert_eq!(s.select(Some("1")), Some("bbb"));
+        // "01" parses as 1 — ordinary usize::from_str behavior, not special-cased.
+        assert_eq!(s.select(Some("01")), Some("bbb"));
+        // Every miss is None; the caller substitutes its built-in default.
+        assert_eq!(s.select(None), None, "no variant selects nothing");
+        assert_eq!(s.select(Some("5")), None, "out of range");
+        assert_eq!(s.select(Some("a")), None, "non-numeric");
+        assert_eq!(s.select(Some("-1")), None, "unparseable as usize");
+    }
+
+    #[test]
+    fn prompt_spec_keyed_selection() {
+        let s = spec(r#"p = { a = "aaa", b = "bbb", default = "ccc" }"#);
+        assert_eq!(s.select(Some("a")), Some("aaa"));
+        assert_eq!(s.select(Some("b")), Some("bbb"));
+        // `default` is an ORDINARY key: it wins only on a literal "default".
+        assert_eq!(s.select(Some("default")), Some("ccc"));
+        assert_eq!(s.select(None), None, "no variant selects nothing");
+        assert_eq!(s.select(Some("z")), None, "unknown key");
+        assert_eq!(s.select(Some("A")), None, "key match is case-sensitive");
+    }
+
+    // ─── validate_prompt_variants ────────────────────────────────────────
+
+    fn cfg(src: &str) -> ModelConfig {
+        ModelConfig::from_toml_str(src).expect("parse ModelConfig")
+    }
+
+    #[test]
+    fn variants_allowed_on_the_composer_task_only() {
+        // Composer: array and table both accepted.
+        assert!(cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"bbb\"]\n")
+        .validate_prompt_variants()
+        .is_ok());
+        assert!(cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"aaa\", b = \"bbb\" }\n")
+        .validate_prompt_variants()
+        .is_ok());
+        // Any other task: rejected.
+        let e = cfg("[tasks.chat_output_filter]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"bbb\"]\n")
+        .validate_prompt_variants()
+        .expect_err("non-composer variant must refuse to boot");
+        assert!(e.contains("chat_output_filter"), "{e}");
+        assert!(e.contains("refuses to boot"), "{e}");
+    }
+
+    #[test]
+    fn plain_filter_prompts_always_validate() {
+        assert!(cfg(
+            "[tasks.chat_output_filter]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                     [tasks.chat_output_filter.tiers.gold]\nfilter_prompt = \"tier p\"\n\
+                     [tasks.world_reply]\nmodel = \"m\"\nfilter_prompt = \"   \"\n"
+        )
+        .validate_prompt_variants()
+        .is_ok());
+        // No filter_prompt anywhere is also fine.
+        assert!(cfg("[tasks.chat_companion]\nmodel = \"m\"\n")
+            .validate_prompt_variants()
+            .is_ok());
+    }
+
+    #[test]
+    fn tier_blocks_never_carry_variants() {
+        // Rejected even under the composer task, because the composer resolves
+        // with `tier = None` and could never select it.
+        let e = cfg(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                     [tasks.chat_image_prompt_compose.tiers.gold]\n\
+                     filter_prompt = [\"aaa\"]\n",
+        )
+        .validate_prompt_variants()
+        .expect_err("tier variant must refuse to boot");
+        assert!(e.contains("tiers.gold"), "{e}");
+    }
+
+    #[test]
+    fn empty_variant_containers_refuse_to_boot() {
+        for src in [
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = []\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = {}\n",
+        ] {
+            let e = cfg(src)
+                .validate_prompt_variants()
+                .expect_err("empty variant container must refuse to boot");
+            assert!(e.contains("empty"), "{e}");
+        }
+    }
+
+    #[test]
+    fn blank_variant_entries_refuse_to_boot() {
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"   \"]\n")
+        .validate_prompt_variants()
+        .expect_err("blank array entry must refuse to boot");
+        assert!(e.contains("index 1"), "{e}");
+
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"aaa\", b = \"  \" }\n")
+        .validate_prompt_variants()
+        .expect_err("blank table value must refuse to boot");
+        assert!(e.contains("blank value for key \"b\""), "{e}");
+
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { \"  \" = \"aaa\" }\n")
+        .validate_prompt_variants()
+        .expect_err("blank table key must refuse to boot");
+        assert!(e.contains("blank key"), "{e}");
+    }
+
+    #[test]
+    fn raw_is_a_reserved_key_case_insensitively() {
+        for key in ["raw", "Raw", "RAW"] {
+            let src = format!(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                 filter_prompt = {{ {key} = \"aaa\", b = \"bbb\" }}\n"
+            );
+            let e = cfg(&src)
+                .validate_prompt_variants()
+                .expect_err("reserved key must refuse to boot");
+            assert!(e.contains("reserved"), "{e}");
+        }
+    }
+
+    #[test]
+    fn whitespace_padded_keyed_key_refuses_to_boot() {
+        // A key like " a " parses and boots fine as TOML, but `select` matches
+        // a client's (already-trimmed) `image.prompt_variant` exactly — so
+        // neither "a" nor " a " could ever select it. Distinct from the
+        // all-whitespace ("blank key") case above: this key is non-blank,
+        // just padded, and the blank-key check must not misfire on it.
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { \" a \" = \"aaa\", b = \"bbb\" }\n")
+        .validate_prompt_variants()
+        .expect_err("whitespace-padded key must refuse to boot");
+        assert!(e.contains("whitespace-padded"), "{e}");
+        assert!(
+            !e.contains("blank key"),
+            "must not be reported as the blank-key case: {e}"
+        );
+    }
+
+    // ─── resolve_image_prompt_compose: variants + raw ────────────────────
+
+    #[test]
+    fn compose_indexed_variant_selection() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"AAA\", \"BBB\"]\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("1"))
+                .unwrap()
+                .compose_prompt,
+            "BBB"
+        );
+        // No variant, and every miss, fall through to the built-in prompt.
+        for v in [None, Some("5"), Some("a"), Some("-1")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                DEFAULT_COMPOSE_PROMPT,
+                "variant {v:?} should fall back to the built-in prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_keyed_variant_selection() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"AAA\", default = \"CCC\" }\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("a"))
+                .unwrap()
+                .compose_prompt,
+            "AAA"
+        );
+        // `default` is an ordinary key — it needs a literal "default" to win.
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("default"))
+                .unwrap()
+                .compose_prompt,
+            "CCC"
+        );
+        for v in [None, Some("z")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                DEFAULT_COMPOSE_PROMPT
+            );
+        }
+    }
+
+    #[test]
+    fn compose_plain_prompt_ignores_the_variant() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = \"custom composer\"\n");
+        for v in [None, Some("a"), Some("3")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                "custom composer"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_blank_plain_prompt_still_falls_back() {
+        // Pre-existing behavior, unchanged: a blank plain string is "commented
+        // out", not a boot failure.
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"   \"\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(None).unwrap().compose_prompt,
+            DEFAULT_COMPOSE_PROMPT
+        );
+    }
+
+    #[test]
+    fn raw_skips_the_composer_in_every_shape() {
+        let sources = [
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = [\"AAA\"]\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"AAA\" }\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n",
+            // No filter_prompt at all (built-in prompt) — raw still wins.
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n",
+        ];
+        for src in sources {
+            let c = cfg(src);
+            for v in ["raw", "Raw", "RAW"] {
+                assert!(
+                    c.resolve_image_prompt_compose(Some(v)).is_none(),
+                    "{v} must skip the composer for: {src}"
+                );
+            }
+            // Sanity: without `raw` the composer is still resolved.
+            assert!(c.resolve_image_prompt_compose(None).is_some(), "{src}");
+        }
+    }
+
+    #[test]
+    fn raw_returns_none_whether_or_not_the_composer_is_configured() {
+        // NOTE: this does NOT pin the "raw check precedes the task lookup"
+        // ordering — `self.tasks.get(COMPOSE_TASK)?` early-returns `None` for
+        // an absent task regardless of which check runs first, so this test
+        // passes under both orderings. It only pins that `raw` still yields
+        // `None` (composer does not run) when the task block is absent, same
+        // as when it's present — a real behavior, just not evidence of order.
+        let c = cfg("[tasks.chat_companion]\nmodel = \"m\"\n");
+        assert!(c.resolve_image_prompt_compose(Some("raw")).is_none());
+        assert!(c.resolve_image_prompt_compose(None).is_none());
+    }
+
+    #[test]
+    fn blank_variant_string_is_treated_as_absent() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"AAA\", \"BBB\"]\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("   "))
+                .unwrap()
+                .compose_prompt,
+            DEFAULT_COMPOSE_PROMPT
+        );
+    }
+
+    #[test]
+    fn raw_variant_is_trimmed_before_the_raw_comparison() {
+        // Pins that the incoming variant is trimmed BEFORE the "raw" match,
+        // not after: `filter_prompt` is a non-blank Plain string here, so if
+        // trimming happened later (or not at all), " raw \n" would fail the
+        // exact `eq_ignore_ascii_case("raw")` comparison, fall through to
+        // normal selection, and this would resolve to `Some(..)` with
+        // compose_prompt = "custom" instead of `None`.
+        let c =
+            cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n");
+        assert!(c.resolve_image_prompt_compose(Some(" raw \n")).is_none());
+    }
+
+    // ─── compose_variant_log_event: the warn/debug guards, pinned directly ──
+    // (no tracing subscriber needed — the decision is a pure function)
+
+    #[test]
+    fn compose_variant_log_event_warns_only_on_an_explicit_unmatched_variant() {
+        // The common case: no prompt_variant was supplied at all. Falling
+        // back to the built-in prompt is silent — nothing was asked for, so
+        // nothing failed to be found.
+        assert_eq!(compose_variant_log_event(None, None, true), None);
+        // A container exists but no filter_prompt at all was configured —
+        // can't happen via the public resolver (selected implies a
+        // filter_prompt), but the guard must not fire even so.
+        assert_eq!(compose_variant_log_event(None, Some("z"), false), None);
+        // The one case that DOES warn: a variant was supplied, a
+        // filter_prompt container exists, and nothing matched.
+        assert_eq!(
+            compose_variant_log_event(None, Some("z"), true),
+            Some(ComposeVariantLogEvent::Mismatch)
+        );
+    }
+
+    #[test]
+    fn compose_variant_log_event_debug_only_when_a_variant_was_supplied_and_matched() {
+        assert_eq!(
+            compose_variant_log_event(Some("AAA"), Some("0"), true),
+            Some(ComposeVariantLogEvent::Selected)
+        );
+        // No variant supplied ⇒ nothing to report, even though `selected` is
+        // `Some` (e.g. a Plain filter_prompt, which always resolves).
+        assert_eq!(compose_variant_log_event(Some("AAA"), None, true), None);
+    }
+
+    // ─── cap_for_log ──────────────────────────────────────────────────────
+
+    #[test]
+    fn cap_for_log_passes_short_strings_through_unchanged() {
+        assert_eq!(cap_for_log("abc", 64), "abc");
+        assert_eq!(cap_for_log("", 64), "");
+        // Exactly at the cap: no truncation marker.
+        assert_eq!(cap_for_log("aaaa", 4), "aaaa");
+    }
+
+    #[test]
+    fn cap_for_log_truncates_on_a_char_boundary_and_marks_it() {
+        assert_eq!(cap_for_log("aaaaa", 4), "aaaa…");
+        // Multi-byte chars: counted/truncated by char, never mid-codepoint
+        // (which would panic on a byte-index slice).
+        let s = "你好世界和平"; // 6 chars
+        assert_eq!(cap_for_log(s, 3), "你好世…");
     }
 }
