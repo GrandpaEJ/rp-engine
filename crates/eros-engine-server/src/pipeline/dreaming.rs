@@ -239,7 +239,7 @@ async fn classify_session(
         }
         let category = normalise_category(&cand.category);
         let metadata = candidate_metadata(cand);
-        match state.voyage.embed_document(trimmed).await {
+        match state.embed.embed_document(trimmed).await {
             Ok(embedding) => {
                 if let Err(e) = repo
                     .upsert(
@@ -260,7 +260,7 @@ async fn classify_session(
                 }
             }
             Err(e) => {
-                tracing::warn!(%session_id, "dreaming: voyage embed failed: {e}");
+                tracing::warn!(%session_id, "dreaming: embed failed: {e}");
             }
         }
     }
@@ -448,7 +448,6 @@ mod tests {
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -527,7 +526,6 @@ mod tests {
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
