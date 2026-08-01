@@ -236,7 +236,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**可选：伴侣图片回复。** 请求体可附加 `image` 对象（`ImageReplyParams`），请求或强制本轮生成一张伴侣发送的图片。`image` 块同时是本轮的 opt-in 开关：**省略它即可关闭本轮的图片生成**（此时 PDE 只能 `reply_text` / `ghost`），或发送 `image: {}` 用任务默认值启用。这样调用方可以用自己的 per-turn 策略独立于 PDE 的内容决策来控制是否出图。`[tasks.chat_image_generation]`（见 [model-config.zh.md](model-config.zh.md)）在这里是**可选的**——它现在只用于门控下方的绘图端点（`POST /comp/chat/{session_id}/image/stream`）；聊天流发出 `image_request` 帧并不依赖它。
+**可选：伴侣图片回复。** 请求体可附加 `image` 对象（`ImageReplyParams`），请求或强制本轮生成一张伴侣发送的图片。`image` 块同时是本轮的 opt-in 开关：**省略它即可关闭本轮的图片生成**（此时 PDE 只能 `reply_text` / `ghost`），或发送 `image: {}` 用引擎内置默认值启用。这样调用方可以用自己的 per-turn 策略独立于 PDE 的内容决策来控制是否出图。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -264,16 +264,16 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 |---|---|---|---|
 | `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策。`false` 时由 PDE 决定。 |
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = 文字 + 图片；`image_only` = 仅图片（允许空 `content`）。 |
-| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | 任务 `default_style` | 引擎内置三种风格预设之一。 |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 引擎内置三种风格预设之一；`"realistic"` 是引擎内置默认值。 |
 | `image_prompt` | `String` | PDE 判断 / 用户文本 | 强制路径的图片主题。PDE 路径使用判断器自己的 `image_prompt`。 |
-| `aspect_ratio` | `String` | 任务 `default_aspect_ratio` | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。非法时返回 `422`。 |
+| `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"`（大小写不敏感）会完全跳过改写器 LLM，直接用种子主题原样出图。下标/key 没命中时回退到引擎内置的改写器提示词——绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
 
-**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于绘图端点（见其请求体）。持久化的 `metadata.image` 标记只记录种子提示词与画幅，不记录参考类型。
+**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记只记录种子提示词与画幅，不记录参考类型。
 
 校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`aspect_ratio` 不在允许集时，作为 pre-stream 错误返回 `422 BadRequest`。
 
-**`image_request` SSE 帧** — 每个图片轮次发出一次，取代任何引擎内绘图。引擎负责组装提示词；由消费方绘制（可直接绘制，也可调用下方的绘图端点）。聊天流本身不绘图、不回传图像字节、不持久化绘图结果。
+**`image_request` SSE 帧** — 每个图片轮次发出一次，取代任何引擎内绘图。引擎负责组装提示词；由消费方通过自己的图像供应商绘制（引擎没有绘图端点）。聊天流本身不绘图、不回传图像字节、不持久化绘图结果。
 
 ```
 data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
@@ -294,36 +294,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
-聊天流不会发送 `image_pending`/`image_attempt`/`image`/`image_failed` 中的任何一帧，也不持久化绘图结果——整体失败的处理归消费方（见下方绘图端点，它才会发出该序列）。
-
-### `POST /comp/chat/{session_id}/image/stream`
-
-可选的 SSE 端点：消费方收到 `image_request` 帧后，可调用此端点让引擎绘制已组合好的
-提示词（也可选择自行绘制）。引擎按**原样**绘制该提示词——不再重新组合、不加载人设——
-且不持久化任何内容（图片存储由消费方负责）。需要模型配置中存在
-`[tasks.chat_image_generation]`；该配置块缺失时端点返回 `501`，消费方需自行绘制。
-鉴权与会话归属校验与 `message/stream` 一致。
-
-**请求体**
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `message_id` | `String` | `image_request` 帧中的助手消息 id `X`；每个绘制帧都会回传。 |
-| `composed_prompt` | `String` | 最终线路提示词的 base64(STANDARD)，取自该帧。按原样绘制。 |
-| `image_ref` | `"face"` \| `"previous"` | 取自该帧；选择参考图。 |
-| `face_ref_url` | `String?` | 脸部/风格参考图的绝对 http(s) URL。 |
-| `prev_image_url` | `String?` | 上一张图片的绝对 http(s) URL（用于 `image_ref: "previous"`；缺失时回退到 `face_ref_url`）。 |
-| `model` | `String?` | 单次绘制的模型覆盖。 |
-| `aspect_ratio` | `String?` | `1:1`、`3:4`、`4:3`、`9:16`、`16:9` 之一。 |
-| `resolution` | `String?` | 显式 `WxH`（优先于 `aspect_ratio`）。 |
-
-**输出帧**——`image_pending → image_attempt* → (image | image_failed)`。
-`image` 帧以 base64 data URL 携带生成的图片（引擎无对象存储）；每个帧都会回传
-`message_id`。
-
-**错误**——`400` `composed_prompt` 非法（base64 解码失败）；`403`/`404` 会话归属；
-`422` URL/画幅/分辨率非法；`429` 达到每用户并发流上限（与聊天流共用）；
-`501`（`image_generation_disabled`）引擎未配置生图——消费方应自行绘制。
+引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 

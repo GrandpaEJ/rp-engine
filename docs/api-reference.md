@@ -255,12 +255,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 `ImageReplyParams` — to request or force a companion-generated image this turn.
 The `image` block is also the per-turn opt-in: **omit it to suppress image
 generation for the turn** (the PDE may then only `reply_text` / `ghost`), or
-send `image: {}` to enable it with the task defaults. This lets a caller's own
+send `image: {}` to enable it with the engine's built-in defaults. This lets a caller's own
 per-turn policy gate images independently of the PDE's content decision.
-`[tasks.chat_image_generation]` (see [model-config.md](model-config.md)) is
-**optional** here — it now gates only the draw endpoint below (`POST
-/comp/chat/{session_id}/image/stream`); the chat stream's `image_request`
-emission does not depend on it.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -289,26 +285,26 @@ draws on the chat stream).
 |---|---|---|---|
 | `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
-| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | task `default_style` | One of the three engine-owned style presets. |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
-| `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
+| `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
 | `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely and draws the seed subject as-is. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
 (`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
 frame (below) — the chat stream never resolves it to a URL itself. The
 `previous`-with-no-image → `face` fallback, and the `face_ref_url` /
-`prev_image_url` reference URLs, belong to the draw endpoint (see its request
-body below). The persisted `metadata.image` marker records only the seed
-subject and aspect ratio, not the reference kind.
+`prev_image_url` reference URLs, belong to the consumer's own image-vendor
+call (the engine has no draw endpoint). The persisted `metadata.image` marker
+records only the seed subject and aspect ratio, not the reference kind.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
 unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
 
 **`image_request` SSE frame** — emitted once per image turn in place of any
-in-engine draw. The engine composes the prompt; the consumer draws it (directly
-or via the draw endpoint below). The chat stream itself draws nothing, streams
-no image bytes, and persists no draw result.
+in-engine draw. The engine composes the prompt; the consumer draws it via its
+own image vendor (there is no engine draw endpoint). The chat stream itself
+draws nothing, streams no image bytes, and persists no draw result.
 
 ```
 data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
@@ -329,41 +325,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
-The chat stream emits none of `image_pending`/`image_attempt`/`image`/`image_failed`
-and persists no draw result — total-failure handling is the consumer's (see the
-draw endpoint below, which does emit that sequence).
-
-### `POST /comp/chat/{session_id}/image/stream`
-
-Opt-in SSE endpoint: on receiving an `image_request` frame, the consumer may
-call this to have the engine draw the composed prompt (instead of drawing it
-itself). The engine draws the prompt **verbatim** — no re-compose, no persona —
-and persists nothing (the consumer owns image storage). Requires
-`[tasks.chat_image_generation]` in the model config; when that block is absent
-the endpoint returns `501` and the consumer must self-draw. Auth + session
-ownership match `message/stream`.
-
-**Request body**
-
-| Field | Type | Notes |
-|---|---|---|
-| `message_id` | `String` | The assistant message id `X` from the `image_request` frame; echoed on every draw frame. |
-| `composed_prompt` | `String` | base64(STANDARD) of the final wire prompt, copied from the frame. Drawn verbatim. |
-| `image_ref` | `"face"` \| `"previous"` | From the frame; selects the reference image. |
-| `face_ref_url` | `String?` | Absolute http(s) URL of the face/style reference. |
-| `prev_image_url` | `String?` | Absolute http(s) URL of the previous image (for `image_ref: "previous"`; falls back to `face_ref_url` when absent). |
-| `model` | `String?` | Per-draw model override. |
-| `aspect_ratio` | `String?` | One of `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
-| `resolution` | `String?` | Explicit `WxH` (overrides `aspect_ratio`). |
-
-**Output frames** — `image_pending → image_attempt* → (image | image_failed)`.
-`image` carries the generated image as a base64 data URL (the engine has no blob
-store); every frame echoes `message_id`.
-
-**Errors** — `400` malformed `composed_prompt` (bad base64); `403`/`404` session
-ownership; `422` bad URL / aspect / resolution; `429` per-user concurrent-stream
-cap reached (shared with the chat stream); `501` (`image_generation_disabled`)
-when the engine has no image-generation config — the consumer should self-draw.
+The engine never draws and no draw-lifecycle frames exist: the consumer
+receives `image_request` and calls its own image vendor.
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
