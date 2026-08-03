@@ -95,16 +95,14 @@ pub struct ImageReplyParams {
     #[schema(value_type = Option<String>)]
     pub style: Option<StyleKey>,
     #[serde(default)]
-    pub image_prompt: Option<String>,
-    #[serde(default)]
     pub aspect_ratio: Option<String>,
     /// Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use
     /// for this turn: an index (`"0"`, `"1"`) for the array shape, or a key
     /// (`"a"`, `"b"`) for the table shape. Ignored when that task configures a
     /// single plain prompt.
     ///
-    /// `"raw"` (case-insensitive) is reserved: it skips the composer LLM
-    /// entirely and draws the seed subject as-is, saving one LLM call.
+    /// `"raw"` carries no special meaning — it selects a prompt only if a
+    /// deployment actually configures one under that key.
     ///
     /// An unknown index/key falls back to the engine's built-in composer
     /// prompt — it is never an error.

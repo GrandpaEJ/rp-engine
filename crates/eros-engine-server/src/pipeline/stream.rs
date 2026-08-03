@@ -158,22 +158,27 @@ fn build_image_request_frame(
     }
 }
 
-/// `metadata.image` marker for a delegated image turn. Always stores the PDE
-/// seed subject (under `prompt`, the key `assistant_transcript_line` reads)
-/// and the aspect ratio; when the composer LLM call SUCCEEDED it also stores
-/// the audit trio `compose_variant` / `compose_model` / `compose_generation_id`
-/// (spec 2026-08-02; absence = no successful compose this turn — raw skip,
+/// `metadata.image` marker for a delegated image turn. Always stores the
+/// composer's subject (under `prompt`, the key `assistant_transcript_line`
+/// reads) and the aspect ratio; stores `caption` when the composer produced
+/// one; when the composer LLM call SUCCEEDED it also stores the audit trio
+/// `compose_variant` / `compose_model` / `compose_generation_id` (spec
+/// 2026-08-02; absence = no successful compose this turn — raw skip,
 /// fail-open, or task not configured). Deliberately NOT stored: the composed
 /// wire prompt (the consumer's job), url, or success/failure of the draw.
 /// Pure.
 fn build_delegated_image_marker(
-    seed_subject: &str,
+    subject: &str,
+    caption: Option<&str>,
     aspect_ratio: Option<&str>,
     compose_variant: Option<&str>,
     compose_model: Option<&str>,
     compose_generation_id: Option<&str>,
 ) -> serde_json::Value {
-    let mut m = serde_json::json!({ "prompt": seed_subject });
+    let mut m = serde_json::json!({ "prompt": subject });
+    if let Some(c) = caption.filter(|s| !s.trim().is_empty()) {
+        m["caption"] = serde_json::Value::String(c.to_string());
+    }
     if let Some(ar) = aspect_ratio.filter(|s| !s.is_empty()) {
         m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
     }
@@ -1513,7 +1518,8 @@ impl PdeAction {
 }
 
 /// Parsed judge verdict. `inner_state` is sanitized (`sanitize_inner_state`)
-/// before it reaches the prompt; `image_prompt`/`reason` are never injected.
+/// before it reaches the prompt; `reason` is never injected. The judge writes
+/// no image prompt — composition belongs to `chat_image_prompt_compose` (#212).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PdeVerdict {
     action: PdeAction,
@@ -1523,8 +1529,6 @@ pub(crate) struct PdeVerdict {
     /// inner_state before injection). `None` on old prompts / null verdicts.
     #[serde(default)]
     tone: Option<String>,
-    #[serde(default)]
-    image_prompt: Option<String>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -1616,13 +1620,12 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "tone", "image_prompt", "reason", "image_ref", "aspect_ratio"],
+                "required": ["action", "inner_state", "tone", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
                     "inner_state": { "type": "string" },
                     "tone": { "type": ["string", "null"] },
-                    "image_prompt": { "type": ["string", "null"] },
                     "reason": { "type": ["string", "null"] },
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
@@ -1753,6 +1756,27 @@ async fn run_pde_decision(
     }
 }
 
+/// Whether an image action is possible this turn.
+///
+/// Two independent facts must both hold: the request carries an `image` block
+/// (the consumer signalling "I handle images this turn" — the engine holds no
+/// image configuration and never draws), and `[tasks.chat_image_prompt_compose]`
+/// is configured. The composer became mandatory when the judge stopped writing
+/// seeds (#212): with no seed and no composer, nothing can produce an image
+/// prompt at all.
+///
+/// The check is the task section's PRESENCE, deliberately not a
+/// `resolve_image_prompt_compose(..)` call: that resolver reaches
+/// `self.resolve(COMPOSE_TASK, None)`, which advances the round-robin model
+/// cursor as a side effect, so calling it merely to answer a capability
+/// question would skew which model later image turns actually pick.
+fn image_capability_available(
+    executor_available: bool,
+    model_config: &eros_engine_llm::model_config::ModelConfig,
+) -> bool {
+    executor_available && model_config.has_task("chat_image_prompt_compose")
+}
+
 /// Map the judge's proposed action to the acted `ActionType`, applying the
 /// hard-safety ghost guardrail (`ghost::ghost_permitted`) and the image-degrade.
 /// Does NOT apply the `ghosting` kill-switch (that is a path-wide final gate).
@@ -1803,7 +1827,6 @@ fn apply_ghosting_killswitch(
             input,
             ActionType::ReplyText,
             hints,
-            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -1884,7 +1907,7 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(
-    transcript: &str,
+    t: &JudgeTranscript,
     input: &eros_engine_core::types::DecisionInput,
     image_available: bool,
     product_qa_recent: Option<&str>,
@@ -1895,10 +1918,10 @@ fn build_pde_ctx(
         eros_engine_core::types::Event::UserMessage { content, .. } => content.as_str(),
         _ => "",
     };
-    let transcript = if transcript.trim().is_empty() {
+    let transcript = if t.transcript.trim().is_empty() {
         "（无）"
     } else {
-        transcript
+        t.transcript.as_str()
     };
     let brief = build_persona_brief(&input.persona);
     let persona_block = if brief.is_empty() {
@@ -1909,6 +1932,15 @@ fn build_pde_ctx(
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
+    // Engine-counted facts: the judge cannot reliably count image markers in
+    // the transcript, so state both numbers explicitly and tell it to trust
+    // this line over the markers.
+    let img_count = t.images_in_window;
+    let last_img = if t.last_assistant_is_image {
+        "是"
+    } else {
+        "否"
+    };
     // Product-QA lines render ONLY when the task is enabled this deployment —
     // old judge prompts see zero drift and pay zero tokens (unlike 图片能力,
     // whose negative is itself a signal). `Some("")` = enabled, no history yet.
@@ -1923,7 +1955,9 @@ fn build_pde_ctx(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
-         [图片能力] 本轮可发图={image_flag}\n{product_qa_section}\n\
+         [图片能力] 本轮可发图={image_flag}\n\
+         [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
+         {product_qa_section}\n\
          [用户最新消息]\n{latest}",
         a.warmth,
         a.trust,
@@ -1948,8 +1982,6 @@ struct VerdictAudit<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tone: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_prompt: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     image_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1962,7 +1994,6 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
             action: v.action.as_str(),
             inner_state: &v.inner_state,
             tone: v.tone.as_deref(),
-            image_prompt: v.image_prompt.as_deref(),
             reason: v.reason.as_deref(),
             image_ref: match v.image_ref {
                 eros_engine_core::types::ImageRef::Face => "face",
@@ -2124,47 +2155,119 @@ struct InputRewrite {
     f_generation_id: Option<String>,
 }
 
-/// Recent rows fed to the rewrite LLM as `[最近对话]` context.
+/// Rows fed to the rewrite LLM as `[最近对话]` context, and the window the
+/// judge's `[近期图片]` counts cover.
+///
+/// NOTE the name is a misnomer kept for compatibility: `ChatRepo::history`
+/// applies `LIMIT` to **rows**, so this is the last 8 *messages* (roughly 4
+/// exchanges), not 8 turns. Anything rendered for a model must say messages.
+/// Renaming it and changing the window are both explicit non-goals of the
+/// image-context design — the issue's bench inherited exactly this window, so
+/// its measured numbers only transfer while the window holds.
 const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
 
 /// Render an assistant transcript line. Image turns persist empty `content`
 /// with the image facts under `metadata.image`; surface a terse marker so the
-/// judge / input filter see that an image was sent (and what it depicted)
+/// judge / input filter see that an image was sent (and roughly what it showed)
 /// instead of a blank `AI:` line. Non-image assistant rows fall back to
 /// `content`. Pure.
+///
+/// The description comes from `metadata.image.caption` — a short line written
+/// by the composer for exactly this purpose. It is deliberately NOT
+/// `metadata.image.prompt`: that is the image-generation subject, which leads
+/// with style-preset and appearance boilerplate and is long enough that echoing
+/// it dominated the judge's context. When no caption exists (rows written before
+/// captions shipped, a composer reply that carried none, a failed compose) the
+/// marker stays bare rather than falling back to the prompt — the anti-spam
+/// brake rides on `[近期图片]`'s counts, which do not depend on this text.
 fn assistant_transcript_line(content: &str, metadata: Option<&serde_json::Value>) -> String {
     if let Some(img) = metadata.and_then(|m| m.get("image")) {
-        let subject = img
-            .get("prompt")
+        let caption = img
+            .get("caption")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("（无描述）");
+            .filter(|s| !s.is_empty());
         let ar = img
             .get("aspect_ratio")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        return if ar.is_empty() {
-            format!("（发送了一张图片：{subject}）")
-        } else {
-            format!("（发送了一张图片：{subject}，画幅 {ar}）")
+        return match (caption, ar.is_empty()) {
+            (None, _) => "（发送了一张图片）".to_string(),
+            (Some(c), true) => format!("（发送了一张图片：{c}）"),
+            (Some(c), false) => format!("（发送了一张图片：{c}，画幅 {ar}）"),
         };
     }
     content.to_string()
 }
 
-/// Build the compact transcript block for the input filter, excluding the turn
-/// being rewritten. Best-effort: a DB error yields an empty transcript.
+/// The judge/input-filter context: the rendered transcript plus the two image
+/// facts the engine can compute exactly and the judge cannot count reliably.
+#[derive(Debug, Default, Clone)]
+struct JudgeTranscript {
+    transcript: String,
+    /// Assistant rows in the window carrying `metadata.image`.
+    images_in_window: usize,
+    /// The newest assistant row in the window is an image turn.
+    last_assistant_is_image: bool,
+}
+
+/// Row-by-row accumulator behind `JudgeTranscript`, split out so the counting
+/// is unit-testable without a database.
+#[derive(Debug, Default)]
+struct JudgeTranscriptAcc {
+    lines: Vec<String>,
+    images_in_window: usize,
+    last_assistant_is_image: bool,
+}
+
+impl JudgeTranscriptAcc {
+    /// Fold one already-filtered row (caller has skipped the current turn and
+    /// channel-marked rows). Rows arrive oldest→newest, so the assistant flag
+    /// is simply overwritten and ends up reflecting the newest assistant row.
+    fn push(&mut self, role: &str, content: &str, metadata: Option<&serde_json::Value>) {
+        let (label, text): (&str, String) = match role {
+            "user" | "gift_user" => ("用户", content.to_string()),
+            "assistant" => {
+                let is_image = metadata.and_then(|m| m.get("image")).is_some();
+                if is_image {
+                    self.images_in_window += 1;
+                }
+                self.last_assistant_is_image = is_image;
+                ("AI", assistant_transcript_line(content, metadata))
+            }
+            _ => return,
+        };
+        self.lines.push(format!("{label}: {text}"));
+    }
+
+    fn finish(self) -> JudgeTranscript {
+        JudgeTranscript {
+            transcript: self.lines.join("\n"),
+            images_in_window: self.images_in_window,
+            last_assistant_is_image: self.last_assistant_is_image,
+        }
+    }
+}
+
+/// Build the compact transcript block for the input filter and the PDE judge,
+/// excluding the turn being rewritten, and count the window's image turns
+/// while the rows are in hand (no second round trip). Best-effort: a DB error
+/// yields an empty transcript and zero counts — which reads to the judge as
+/// "no recent images", the same signal an empty transcript gives today.
 async fn build_input_filter_transcript(
     chat_repo: &ChatRepo<'_>,
     session_id: Uuid,
     current_user_message_id: Uuid,
-) -> String {
+) -> JudgeTranscript {
+    // +1: the turn being processed is already persisted, so it always occupies
+    // the newest fetched slot and is then excluded below. Fetching exactly the
+    // window size would leave 7 prior messages while `[近期图片]` tells the
+    // judge it counted 8 — an every-turn off-by-one on the anti-spam facts.
     let rows = chat_repo
-        .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
+        .history(session_id, INPUT_FILTER_CONTEXT_TURNS + 1, 0)
         .await
         .unwrap_or_default();
-    let mut lines = Vec::new();
+    let mut acc = JudgeTranscriptAcc::default();
     for m in rows {
         if m.id == current_user_message_id {
             continue;
@@ -2177,20 +2280,13 @@ async fn build_input_filter_transcript(
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
-        let (label, text): (&str, String) = match m.role.as_str() {
-            "user" | "gift_user" => (
-                "用户",
-                crate::pipeline::handlers::effective_user_text(&m).to_string(),
-            ),
-            "assistant" => (
-                "AI",
-                assistant_transcript_line(&m.content, m.metadata.as_ref()),
-            ),
-            _ => continue,
+        let text = match m.role.as_str() {
+            "user" | "gift_user" => crate::pipeline::handlers::effective_user_text(&m).to_string(),
+            _ => m.content.clone(),
         };
-        lines.push(format!("{label}: {text}"));
+        acc.push(&m.role, &text, m.metadata.as_ref());
     }
-    lines.join("\n")
+    acc.finish()
 }
 
 /// Run the input-filter LLM over the raw user input with recent context.
@@ -2288,26 +2384,65 @@ async fn run_input_filter(
     None // chain exhausted → keep
 }
 
-/// Assemble the composer's user message from the appearance, recent scene, seed
-/// subject, style, and aspect ratio. Pure (kept separate so it is testable
-/// without a network call).
+/// Assemble the composer's user message from the appearance, recent scene,
+/// latest user message, style, and aspect ratio. Pure (kept separate so it is
+/// testable without a network call).
 fn compose_user_payload(
     appearance: &str,
     recent_scene: &str,
-    seed_subject: &str,
+    latest_user_msg: &str,
     style: &str,
     aspect_ratio: &str,
 ) -> String {
     format!(
-        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
-/// A SUCCESSFUL composer call's result: the enriched subject plus the audit
-/// values persisted to `metadata.image` (spec 2026-08-02). Mirrors
-/// `VisionOutcome`.
+/// The composer's JSON contract.
+#[derive(serde::Deserialize)]
+struct ComposeReply {
+    prompt: String,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// Parse a composer reply into `(prompt, caption)`.
+///
+/// Direct JSON first, then a balanced JSON block in prose (same ladder as
+/// `parse_pde_verdict`). **A reply that is neither becomes the prompt with no
+/// caption** — deliberate, and load-bearing for migration: a deployment that
+/// ships this version without rewriting its EXPAND-era composer `filter_prompt`
+/// still gets working images (degraded, since that prompt aims at a seed that
+/// is now usually empty), just bare markers until the prompt is updated.
+///
+/// A blank caption is normalised to `None`; callers must not persist `""`.
+fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
+    let parsed = serde_json::from_str::<ComposeReply>(raw).ok().or_else(|| {
+        super::find_json_block(raw).and_then(|b| serde_json::from_str::<ComposeReply>(b).ok())
+    });
+    match parsed {
+        Some(r) => {
+            let caption = r
+                .caption
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty());
+            (r.prompt.trim().to_string(), caption)
+        }
+        None => (raw.trim().to_string(), None),
+    }
+}
+
+/// A SUCCESSFUL composer call's result: the picture subject, the short caption
+/// for history-facing renders, plus the audit values persisted to
+/// `metadata.image` (spec 2026-08-02). Mirrors `VisionOutcome`.
 struct ComposeOutcome {
-    text: String,
+    prompt: String,
+    /// One short line describing what the picture shows, for the chat history
+    /// and the judge transcript. `None` when the model gave none — including
+    /// when the reply wasn't JSON at all (the migration fallback in
+    /// `parse_compose_reply`, where the whole reply becomes `prompt` instead).
+    caption: Option<String>,
     /// Model that actually answered: `resp.model`, falling back to the
     /// attempted model id (same idiom as the vision audit).
     model: String,
@@ -2317,17 +2452,17 @@ struct ComposeOutcome {
     variant: Option<String>,
 }
 
-/// Enrich the image subject via the optional composer LLM. Walks
-/// `[model] + fallback` on transport failure (error/timeout/empty); returns the
-/// trimmed enriched subject plus the audit trio on first success, or `None`
-/// (caller falls back to the seed). Never blocks or fails the image turn.
-/// Mirrors `run_input_filter`.
+/// Generate the image prompt (and its caption) via the optional composer LLM.
+/// Walks `[model] + fallback` on transport failure (error/timeout/empty);
+/// returns the parsed prompt/caption plus the audit trio on first success, or
+/// `None` (caller falls back to an empty subject — the portrait path). Never
+/// blocks or fails the image turn. Mirrors `run_input_filter`.
 async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     persona: &eros_engine_core::persona::CompanionPersona,
-    seed_subject: &str,
     recent_scene: &str,
+    latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
 ) -> Option<ComposeOutcome> {
@@ -2341,8 +2476,13 @@ async fn run_image_prompt_compose(
     } else {
         recent_scene
     };
+    let latest = if latest_user_msg.trim().is_empty() {
+        "（无）"
+    } else {
+        latest_user_msg
+    };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    let user_payload = compose_user_payload(appearance, scene, seed_subject, style, ar);
+    let user_payload = compose_user_payload(appearance, scene, latest, style, ar);
     let chain: Vec<String> = std::iter::once(c.model.clone())
         .chain(c.fallback_model.iter().cloned())
         .collect();
@@ -2383,8 +2523,14 @@ async fn run_image_prompt_compose(
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
             continue;
         }
+        let (prompt, caption) = parse_compose_reply(&text);
+        if prompt.is_empty() {
+            tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
+            continue;
+        }
         return Some(ComposeOutcome {
-            text,
+            prompt,
+            caption,
             model: resp.model.unwrap_or_else(|| model_id.clone()),
             generation_id: resp.generation_id,
             variant: c.variant_key.clone(),
@@ -2393,18 +2539,22 @@ async fn run_image_prompt_compose(
     None
 }
 
-/// The three per-turn image inputs, resolved from plan → request.
+/// The two per-turn image inputs, resolved from plan → request. There is no
+/// subject field: the composer decides what the picture shows from turn
+/// context alone.
 struct ImageTurnInputs {
-    seed_subject: String,
     style: eros_engine_llm::model_config::StyleKey,
     aspect_ratio: Option<String>,
 }
 
-/// Pure: resolve the seed subject, style, and aspect ratio for a delegated
-/// image turn. Precedence per field:
-/// - subject: `plan.image_prompt` → `req_image.image_prompt` → `""`
-/// - style:   `req_image.style` → type default (`Realistic`)
-/// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
+/// Pure: resolve the style and aspect ratio for a delegated image turn.
+/// Precedence per field:
+/// - style:  `req_image.style` → type default (`Realistic`)
+/// - aspect: `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
+///
+/// There is no subject input here: the judge no longer writes a seed (#212
+/// Task 4) and the client can no longer supply one either (#212 Task 5) — the
+/// composer decides what the picture shows from turn context alone.
 ///
 /// Blank strings count as absent at the plan and request levels. There are no
 /// config-level defaults: the engine carries no image configuration, so style
@@ -2413,17 +2563,6 @@ fn resolve_image_turn_inputs(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
 ) -> ImageTurnInputs {
-    let seed_subject = plan
-        .image_prompt
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            req_image
-                .and_then(|i| i.image_prompt.as_deref())
-                .filter(|s| !s.trim().is_empty())
-        })
-        .unwrap_or("")
-        .to_string();
     let style = req_image.and_then(|i| i.style).unwrap_or_default();
     let aspect_ratio = plan
         .aspect_ratio
@@ -2436,7 +2575,6 @@ fn resolve_image_turn_inputs(
         })
         .map(str::to_string);
     ImageTurnInputs {
-        seed_subject,
         style,
         aspect_ratio,
     }
@@ -2446,8 +2584,18 @@ fn resolve_image_turn_inputs(
 /// absent: it is consumed internally by `compose_image_prompt` and neither
 /// caller uses it afterwards.
 struct DelegatedImagePrompt {
-    /// Seed subject — feeds `build_delegated_image_marker`.
-    seed_subject: String,
+    /// What described the picture — feeds `build_delegated_image_marker`'s
+    /// `prompt` key. The composer's decided subject on the compose path
+    /// (spec 2026-08-02: this is deliberately the SHORT subject, not the
+    /// composed wire string — that lives only in `composed_prompt`, below, and
+    /// is never persisted); empty when the composer is skipped (not
+    /// configured, or `raw`) or the compose call fails — there is no seed left
+    /// to fall back to, so an empty subject is the portrait fallback (#212).
+    subject: String,
+    /// Short description of the picture, persisted as `metadata.image.caption`
+    /// and read by every history-facing render. `None` on a failed compose or
+    /// when the task is not configured.
+    caption: Option<String>,
     /// Effective aspect ratio — feeds the marker and the wire frame.
     aspect_ratio: Option<String>,
     /// Final wire prompt — feeds the wire frame.
@@ -2459,18 +2607,62 @@ struct DelegatedImagePrompt {
     compose_generation_id: Option<String>,
 }
 
-/// Resolve the per-turn image inputs, optionally enrich the subject via the
-/// composer LLM, and wrap the result into the final wire prompt.
+/// Guards a speculatively-spawned `tokio::task::JoinHandle` so it is aborted
+/// if it's ever dropped without being joined. Dropping a `JoinHandle` on its
+/// own does NOT cancel the task — it keeps running to completion in the
+/// background, discarding its result. `reply_text_image` spawns the image
+/// composer early (concurrently with the chat call) so its latency hides
+/// underneath, but the turn that spawned it can end several ways before
+/// reaching the join point (an error frame, a ghost-fallback turn with no
+/// produced row to attach an image to, the whole stream being dropped by a
+/// disconnected client, ...). None of those turns will ever emit an image
+/// frame, so an in-flight compose call at that point has no consumer left —
+/// letting it run to completion would just waste an LLM round trip. Wrapping
+/// the handle in this guard means every current AND future early exit aborts
+/// the task automatically, instead of requiring each one to remember to.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    /// Await the guarded task WITHOUT releasing the guard. `JoinHandle` is
+    /// `Unpin`, so a `&mut` await works — and because the handle never leaves
+    /// the guard, a caller dropped mid-await (client disconnect at exactly the
+    /// join point) still aborts the in-flight task. Taking the handle out
+    /// first would open that window: between `take()` and the await's
+    /// completion, a drop would detach the raw `JoinHandle` and the task would
+    /// run on with no consumer. After a completed await the handle stays put;
+    /// aborting a finished task is a no-op, so the drop-time abort is
+    /// harmless.
+    async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        match self.0.as_mut() {
+            Some(h) => Some(h.await),
+            None => None,
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// Resolve the per-turn image inputs, generate the subject via the composer
+/// LLM, and wrap the result into the final wire prompt.
 ///
 /// The composer is skipped entirely when it is not configured. It is fail-open
-/// throughout: a model error, timeout, or empty reply degrades to the seed
-/// subject and never blocks the image turn.
+/// throughout: a model error, timeout, or empty reply degrades to an empty
+/// subject — there is nothing left to fall back to — and never blocks the
+/// image turn. `compose_image_prompt` turns that empty subject into a plain
+/// persona-appearance portrait prompt (#212).
 async fn build_delegated_image_prompt(
     state: &AppState,
     persona: &eros_engine_core::persona::CompanionPersona,
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
     pde_transcript: &str,
+    latest_user_msg: &str,
 ) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
@@ -2478,14 +2670,16 @@ async fn build_delegated_image_prompt(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "realistic".to_string());
     let variant = req_image.and_then(|i| i.prompt_variant.as_deref());
-    let compose = match state.model_config.resolve_image_prompt_compose(variant) {
+    let resolved_compose = state.model_config.resolve_image_prompt_compose(variant);
+    let composer_configured = resolved_compose.is_some();
+    let compose = match resolved_compose {
         Some(c) => {
             run_image_prompt_compose(
                 state,
                 &c,
                 persona,
-                &inputs.seed_subject,
                 pde_transcript,
+                latest_user_msg,
                 inputs.aspect_ratio.as_deref(),
                 &style_str,
             )
@@ -2493,14 +2687,45 @@ async fn build_delegated_image_prompt(
         }
         None => None,
     };
-    let (final_subject, compose_variant, compose_model, compose_generation_id) = match compose {
-        Some(o) => (o.text, o.variant, Some(o.model), o.generation_id),
-        None => (inputs.seed_subject.clone(), None, None, None),
-    };
+    let (final_subject, caption, compose_variant, compose_model, compose_generation_id) =
+        match compose {
+            Some(o) => (
+                o.prompt,
+                o.caption,
+                o.variant,
+                Some(o.model),
+                o.generation_id,
+            ),
+            None => {
+                // Loud on purpose: this is the ONE path where the capability
+                // gate (`本轮可发图=否` when the composer isn't configured) is
+                // bypassed — a forced image turn (`image.force = true`) always
+                // reaches here regardless of gate state. A deployment that
+                // upgraded past #212 without configuring
+                // `[tasks.chat_image_prompt_compose]` would otherwise silently
+                // get a generic persona-portrait prompt on every forced image,
+                // with zero log lines anywhere else on this path. Still a warn,
+                // not an error: the portrait fallback is the sanctioned
+                // fail-open degradation, not a bug.
+                tracing::warn!(
+                    composer_configured,
+                    "image-compose: no subject produced this turn; falling back to a generic \
+                     persona-portrait prompt ({})",
+                    if composer_configured {
+                        "composer chain failed — see the preceding image-compose warn for the \
+                         model and reason"
+                    } else {
+                        "no [tasks.chat_image_prompt_compose] configured"
+                    }
+                );
+                (String::new(), None, None, None, None)
+            }
+        };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
     DelegatedImagePrompt {
-        seed_subject: inputs.seed_subject,
+        subject: final_subject,
+        caption,
         aspect_ratio: inputs.aspect_ratio,
         composed_prompt,
         compose_variant,
@@ -2845,9 +3070,11 @@ pub fn run_stream(
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
         // consumer signalling "I handle images this turn"). The engine holds
-        // no image configuration at all.
+        // no image configuration at all. Image capability = that PLUS a
+        // composer configured to write the prompt (#212).
         let req_image = user_msg.image.as_ref();
-        let image_executor_available = req_image.is_some();
+        let image_executor_available =
+            image_capability_available(req_image.is_some(), &state.model_config);
         let force_image = req_image.is_some_and(|i| i.force) && !is_tip;
         // Skip resolution on tip turns: the judge won't run, and resolve_pde()
         // advances the round-robin model cursor as a side effect — resolving on a
@@ -2880,13 +3107,18 @@ pub fn run_stream(
         };
         let product_qa_recent: Option<String> =
             product_qa_available.then(|| render_product_qa_pairs(&product_qa_pairs));
-        // Shared history transcript: built once, reused by the judge here AND the
-        // input filter below (which previously fetched its own). `resolved_pde` is
-        // already None on tip turns, so this only fires for a real judge turn.
-        let pde_transcript: String = if resolved_pde.is_some() {
+        // Shared history transcript: built once, reused by the judge here, the
+        // input filter below (which previously fetched its own), AND the image
+        // composer's `[最近场景]`. Fetched whenever any of them can need it this
+        // turn: a judge turn (`resolved_pde` — already None on tips), or a
+        // forced image turn. The composer generates from the recent scene now
+        // that no seed exists, so a forced image with the judge disabled must
+        // not lose that context; rule-based `pde::decide` never picks image
+        // actions, so `force_image` is the only judge-less image path.
+        let pde_transcript: JudgeTranscript = if resolved_pde.is_some() || force_image {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
-            String::new()
+            JudgeTranscript::default()
         };
         let mut killswitch_hints: Vec<String> = Vec::new();
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
@@ -2920,23 +3152,20 @@ pub fn run_stream(
                                 .as_deref()
                                 .map(sanitize_inner_state)
                                 .filter(|s| !s.is_empty());
-                            // Capture the judge's image prompt while `v` is still
-                            // borrowed here (the run/verdict is moved into the
-                            // audit task below). Only image actions carry it.
+                            // Only image actions carry the judge's image_ref /
+                            // aspect_ratio; `v` is still borrowed here (the
+                            // run/verdict is moved into the audit task below).
                             let is_image = matches!(
                                 action,
                                 ActionType::ReplyImage | ActionType::ReplyTextImage
                             );
-                            let img_prompt = if is_image { v.image_prompt.clone() } else { None };
                             let img_ref = if is_image {
                                 v.image_ref
                             } else {
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(
-                                &input, action, hints, tone, img_prompt, img_ref, img_aspect,
-                            )
+                            pde::plan_for(&input, action, hints, tone, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2956,8 +3185,9 @@ pub fn run_stream(
 
         // Forced-image override — wins over the PDE/ghost result. Applied AFTER
         // the kill-switch so a client-forced image is never suppressed to ghost.
-        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. Carries
-        // the client-supplied image prompt (not the judge's).
+        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. There
+        // is no subject to carry through here — the composer decides what the
+        // picture shows from turn context alone (`resolve_image_turn_inputs`).
         if force_image {
             let action = match req_image.map(|i| &i.mode) {
                 Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
@@ -2970,7 +3200,6 @@ pub fn run_stream(
                 action,
                 plan.context_hints.clone(),
                 plan.reply_tone.clone(),
-                req_image.and_then(|i| i.image_prompt.clone()),
                 eros_engine_core::types::ImageRef::Face,
                 None,
             );
@@ -3280,6 +3509,7 @@ pub fn run_stream(
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
+                let mut image_only_caption: Option<String> = None;
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
                     // Delegate-only: compose the prompt and emit `image_request`;
@@ -3293,23 +3523,26 @@ pub fn run_stream(
                         &input.persona,
                         &plan,
                         req_image,
-                        &pde_transcript,
+                        &pde_transcript.transcript,
+                        &user_msg.content,
                     )
                     .await;
-                    let subject = img.seed_subject;
+                    let subject = img.subject;
                     let aspect = img.aspect_ratio;
                     let composed_prompt = img.composed_prompt;
-                    // Persist the marker (seed subject + aspect + compose
+                    // Persist the marker (subject + caption + aspect + compose
                     // audit trio on success) so the PDE stays image-aware
                     // (§5); the composed prompt and the draw result live with
                     // the consumer.
                     let marker = build_delegated_image_marker(
                         &subject,
+                        img.caption.as_deref(),
                         aspect.as_deref(),
                         img.compose_variant.as_deref(),
                         img.compose_model.as_deref(),
                         img.compose_generation_id.as_deref(),
                     );
+                    image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
                         id: msg_uuid,
                         content: String::new(),
@@ -3333,7 +3566,8 @@ pub fn run_stream(
                         tracing::warn!("stream(image): persist failed: {e}");
                     }
                     // full_text="" so insight/memory extraction skips this row;
-                    // affinity uses plan.image_prompt as the proxy.
+                    // affinity uses plan.image_caption (set below, from the
+                    // picture's caption) as the proxy.
                     image_only_produced.push(crate::pipeline::post_process::ProducedMessage {
                         message_id: msg_uuid,
                         full_text: String::new(),
@@ -3379,7 +3613,8 @@ pub fn run_stream(
                     yield final_frame;
 
                     let state_bg = (*state).clone();
-                    let plan_bg = plan.clone();
+                    let mut plan_bg = plan.clone();
+                    plan_bg.image_caption = image_only_caption;
                     let event_bg = Event::UserMessage {
                         content: user_msg.content.clone(),
                         message_id: user_msg.user_message_id,
@@ -3449,6 +3684,14 @@ pub fn run_stream(
                 // Skip tipped turns too: a tip persists as role='gift_user' whose
                 // "(打赏 $X)" marker / typed message should reach the model as-is,
                 // not be rewritten by the filter — running it would waste the call.
+                //
+                // The text the model will actually see this turn. The input
+                // filter persists its rewrite and `build_reply_request` re-reads
+                // it from the DB; the composer runs concurrently and must not
+                // pay a second read, so track it locally. Keeping the composer
+                // on the SAME text as the chat model is what stops the picture
+                // drifting from the reply.
+                let mut effective_user_msg = user_msg.content.clone();
                 if user_msg.tips_amount_usd.is_none() {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
@@ -3464,8 +3707,8 @@ pub fn run_stream(
                         // Two round-trips per reply turn — acceptable, not a hot loop.
                         // Reuse the PDE's transcript when it was built this turn;
                         // otherwise fetch (input-filter-only turns: PDE off).
-                        let transcript = if !pde_transcript.is_empty() {
-                            pde_transcript.clone()
+                        let transcript = if !pde_transcript.transcript.is_empty() {
+                            pde_transcript.transcript.clone()
                         } else {
                             build_input_filter_transcript(
                                 &chat_repo,
@@ -3473,11 +3716,12 @@ pub fn run_stream(
                                 user_msg.user_message_id,
                             )
                             .await
+                            .transcript
                         };
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
                         {
-                            if let Err(e) = chat_repo
+                            match chat_repo
                                 .set_user_input_rewrite(
                                     user_msg.user_message_id,
                                     &rw.rewritten_text,
@@ -3487,11 +3731,55 @@ pub fn run_stream(
                                 )
                                 .await
                             {
-                                tracing::warn!("stream: input-filter rewrite persist failed: {e}");
+                                // The chat model reads the effective text back
+                                // from the DB row (build_reply_request), so the
+                                // composer may track the rewrite only once it is
+                                // persisted — on a failed write the chat model
+                                // will see the ORIGINAL text, and handing the
+                                // composer the unpersisted rewrite would let the
+                                // picture drift from the reply.
+                                Ok(()) => effective_user_msg = rw.rewritten_text.clone(),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "stream: input-filter rewrite persist failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                // ── Concurrent image composition (reply_text_image only) ──────
+                // Fired here, after the input filter (so the composer sees the
+                // same text as the chat model) and before build_reply_request —
+                // which alone does a 20-row history fetch, an embedding call and
+                // memory/world recall before the chat stream even starts. One
+                // short composer call hides completely underneath, taking the
+                // turn's serial LLM hops from 3 to 2.
+                //
+                // `reply_image` is deliberately excluded: it has no text task to
+                // overlap with and returns early via `image_only_done`.
+                let mut compose_handle: AbortOnDrop<DelegatedImagePrompt> =
+                    if matches!(plan.action_type, ActionType::ReplyTextImage) {
+                        let state_c = (*state).clone();
+                        let persona_c = input.persona.clone();
+                        let plan_c = plan.clone();
+                        let req_image_c = req_image.cloned();
+                        let scene_c = pde_transcript.transcript.clone();
+                        let latest_c = effective_user_msg.clone();
+                        AbortOnDrop(Some(tokio::spawn(async move {
+                            build_delegated_image_prompt(
+                                &state_c,
+                                &persona_c,
+                                &plan_c,
+                                req_image_c.as_ref(),
+                                &scene_c,
+                                &latest_c,
+                            )
+                            .await
+                        })))
+                    } else {
+                        AbortOnDrop(None)
+                    };
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
@@ -3500,6 +3788,13 @@ pub fn run_stream(
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
+                        // Dropping `compose_handle` here (via the enclosing
+                        // `return` below) aborts the spawned compose task
+                        // through `AbortOnDrop`'s `Drop` impl — no manual
+                        // `.abort()` needed, and every OTHER early exit
+                        // between here and the join point (chat-burst error,
+                        // ghost fallback with no produced row, client
+                        // disconnect) gets the same coverage for free.
                         yield ProtocolFrame::Error {
                             code: StreamErrorCode::Internal,
                             retryable: false,
@@ -3611,27 +3906,54 @@ pub fn run_stream(
                 // order: meta → delta* → done → image → final. On image failure
                 // (or zero images / empty produced) we emit NO Image frame — the
                 // text reply already reached the client, so the turn is complete.
+                let mut image_caption: Option<String> = None;
                 if matches!(plan.action_type, ActionType::ReplyTextImage) {
                     if let Some(last) = produced.last() {
                         let msg_uuid = last.message_id;
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
-                        let img = build_delegated_image_prompt(
-                            &state,
-                            &input.persona,
-                            &plan,
-                            req_image,
-                            &pde_transcript,
-                        )
-                        .await;
-                        let subject = img.seed_subject;
+                        // The composer was spawned before the chat call; by now
+                        // it has almost always finished, so this await is ~free.
+                        // Awaited THROUGH the guard so a client disconnect at
+                        // this exact point still aborts the in-flight call. A
+                        // panicked or cancelled task degrades exactly like a
+                        // failed compose — never a dropped frame.
+                        let img = match compose_handle.join().await {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => {
+                                tracing::warn!("image-compose task failed: {e}");
+                                build_delegated_image_prompt(
+                                    &state,
+                                    &input.persona,
+                                    &plan,
+                                    req_image,
+                                    &pde_transcript.transcript,
+                                    &effective_user_msg,
+                                )
+                                .await
+                            }
+                            None => {
+                                build_delegated_image_prompt(
+                                    &state,
+                                    &input.persona,
+                                    &plan,
+                                    req_image,
+                                    &pde_transcript.transcript,
+                                    &effective_user_msg,
+                                )
+                                .await
+                            }
+                        };
+                        let subject = img.subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
-                        // Merge the marker (seed subject + aspect + compose
+                        image_caption = img.caption.clone();
+                        // Merge the marker (subject + caption + aspect + compose
                         // audit trio on success) onto the already-persisted
                         // text row so the PDE stays image-aware (§5). The text
                         // already reached the client; `final` follows below.
                         let marker = build_delegated_image_marker(
                             &subject,
+                            img.caption.as_deref(),
                             aspect.as_deref(),
                             img.compose_variant.as_deref(),
                             img.compose_model.as_deref(),
@@ -3675,6 +3997,7 @@ pub fn run_stream(
                 if plan_bg.action_type == ActionType::ReplyImage {
                     plan_bg.action_type = ActionType::ReplyText;
                 }
+                plan_bg.image_caption = image_caption;
                 let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,
@@ -3957,23 +4280,107 @@ mod tests {
         let p = compose_user_payload(
             "freckled, red hair",
             "（无）",
-            "on a rooftop",
+            "（无）",
             "realistic",
             "9:16",
         );
         assert!(p.contains("freckled, red hair"));
         assert!(p.contains("（无）"));
-        assert!(p.contains("on a rooftop"));
         assert!(p.contains("realistic"));
         assert!(p.contains("9:16"));
     }
 
+    #[test]
+    fn compose_user_payload_includes_latest_user_message() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "给我看看你现在的样子",
+            "realistic",
+            "9:16",
+        );
+        assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
+    }
+
+    #[test]
+    fn compose_user_payload_has_no_seed_section() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "给我看看你现在的样子",
+            "realistic",
+            "9:16",
+        );
+        assert!(
+            !p.contains("画面主题种子"),
+            "the seed concept is deleted — no seed section may render: {p}"
+        );
+        assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
+        assert!(p.contains("[人物外观]\nfreckled, red hair"), "{p}");
+        assert!(p.contains("[风格]\nrealistic"), "{p}");
+        assert!(p.contains("[画幅]\n9:16"), "{p}");
+    }
+
+    #[test]
+    fn parse_compose_reply_reads_direct_json() {
+        let (p, c) =
+            parse_compose_reply(r#"{"prompt":"on a rooftop at dusk","caption":"在天台看夕阳"}"#);
+        assert_eq!(p, "on a rooftop at dusk");
+        assert_eq!(c.as_deref(), Some("在天台看夕阳"));
+    }
+
+    #[test]
+    fn parse_compose_reply_salvages_json_in_prose() {
+        let raw = "Sure! Here you go:\n{\"prompt\":\"a selfie in a cafe\",\"caption\":\"咖啡店自拍\"}\nHope that helps.";
+        let (p, c) = parse_compose_reply(raw);
+        assert_eq!(p, "a selfie in a cafe");
+        assert_eq!(c.as_deref(), Some("咖啡店自拍"));
+    }
+
+    #[test]
+    fn parse_compose_reply_plain_text_becomes_prompt_with_no_caption() {
+        // Migration fallback: an EXPAND-era composer prompt still yields a
+        // working image prompt, just no caption.
+        let (p, c) = parse_compose_reply("  a windswept portrait on the cliffs  ");
+        assert_eq!(p, "a windswept portrait on the cliffs");
+        assert_eq!(c, None);
+    }
+
+    #[test]
+    fn parse_compose_reply_blank_caption_is_none() {
+        let (p, c) = parse_compose_reply(r#"{"prompt":"x","caption":"   "}"#);
+        assert_eq!(p, "x");
+        assert_eq!(c, None, "a blank caption is absent, not empty-string");
+    }
+
+    #[test]
+    fn delegated_image_marker_carries_caption_when_present() {
+        let m = build_delegated_image_marker(
+            "on a rooftop",
+            Some("在天台"),
+            Some("3:4"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m["prompt"], "on a rooftop");
+        assert_eq!(m["caption"], "在天台");
+        assert_eq!(m["aspect_ratio"], "3:4");
+    }
+
+    #[test]
+    fn delegated_image_marker_omits_absent_caption() {
+        let m = build_delegated_image_marker("on a rooftop", None, None, None, None, None);
+        assert_eq!(m["prompt"], "on a rooftop");
+        assert!(
+            m.get("caption").is_none(),
+            "absent caption must not be written: {m}"
+        );
+    }
+
     // ─── resolve_image_turn_inputs ───────────────────────────────────────
 
-    fn img_plan(
-        image_prompt: Option<&str>,
-        aspect: Option<&str>,
-    ) -> eros_engine_core::types::ActionPlan {
+    fn img_plan(aspect: Option<&str>) -> eros_engine_core::types::ActionPlan {
         eros_engine_core::types::ActionPlan {
             action_type: ActionType::ReplyImage,
             reply_style: eros_engine_core::types::ReplyStyle::Neutral,
@@ -3981,19 +4388,17 @@ mod tests {
             energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: image_prompt.map(str::to_string),
+            image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
         }
     }
 
     fn img_params(
-        image_prompt: Option<&str>,
         style: Option<eros_engine_llm::model_config::StyleKey>,
         aspect: Option<&str>,
     ) -> crate::routes::companion_stream::ImageReplyParams {
         crate::routes::companion_stream::ImageReplyParams {
-            image_prompt: image_prompt.map(str::to_string),
             style,
             aspect_ratio: aspect.map(str::to_string),
             ..Default::default()
@@ -4001,61 +4406,37 @@ mod tests {
     }
 
     #[test]
-    fn image_turn_subject_prefers_plan_then_request_then_empty() {
-        let params = img_params(Some("from request"), None, None);
-
-        // plan wins
-        let r = resolve_image_turn_inputs(&img_plan(Some("from plan"), None), Some(&params));
-        assert_eq!(r.seed_subject, "from plan");
-
-        // blank plan subject falls through to the request
-        let r = resolve_image_turn_inputs(&img_plan(Some("   "), None), Some(&params));
-        assert_eq!(r.seed_subject, "from request");
-
-        // neither ⇒ empty string
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
-        assert_eq!(r.seed_subject, "");
-
-        // blank request value, plan absent ⇒ falls through to empty string
-        // too, not the blank string itself (the request-level blank filter
-        // must still fire).
-        let blank_params = img_params(Some("   "), None, None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
-        assert_eq!(r.seed_subject, "");
-    }
-
-    #[test]
     fn image_turn_style_prefers_request_then_default() {
         use eros_engine_llm::model_config::StyleKey;
 
-        let params = img_params(None, Some(StyleKey::SemiRealistic), None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&params));
+        let params = img_params(Some(StyleKey::SemiRealistic), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&params));
         assert_eq!(r.style, StyleKey::SemiRealistic, "request wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), None);
         assert_eq!(r.style, StyleKey::default(), "no request ⇒ type default");
     }
 
     #[test]
     fn image_turn_aspect_prefers_plan_then_request_then_none() {
-        let params = img_params(None, None, Some("16:9"));
+        let params = img_params(None, Some("16:9"));
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("3:4")), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(Some("3:4")), Some(&params));
         assert_eq!(r.aspect_ratio.as_deref(), Some("3:4"), "plan wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("  ")), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(Some("  ")), Some(&params));
         assert_eq!(
             r.aspect_ratio.as_deref(),
             Some("16:9"),
             "blank plan ⇒ request"
         );
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), None);
         assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
 
         // Blank request value ⇒ the request-level blank filter still fires.
-        let blank_params = img_params(None, None, Some("  "));
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
+        let blank_params = img_params(None, Some("  "));
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&blank_params));
         assert_eq!(r.aspect_ratio, None, "blank request ⇒ None");
     }
 
@@ -4274,27 +4655,278 @@ mod tests {
 
     #[test]
     fn assistant_transcript_line_marks_image_turns() {
-        // image turn: empty content, facts under metadata.image
-        let meta =
-            serde_json::json!({"image":{"prompt":"on the beach at sunset","aspect_ratio":"3:4"}});
+        // image turn with a caption: the CAPTION surfaces, never the prompt
+        let meta = serde_json::json!({"image":{
+            "prompt":"Photorealistic, ultra-detailed, on the beach at sunset",
+            "caption":"在沙滩看日落",
+            "aspect_ratio":"3:4"
+        }});
         let line = assistant_transcript_line("", Some(&meta));
+        assert!(line.contains("在沙滩看日落"), "caption surfaced: {line}");
         assert!(
-            line.contains("on the beach at sunset"),
-            "subject surfaced: {line}"
+            !line.contains("Photorealistic"),
+            "the image prompt must never reach the transcript: {line}"
         );
         assert!(line.contains("3:4"), "aspect surfaced: {line}");
-        assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
-        // image turn without aspect_ratio: still marks, no panic
-        let meta2 = serde_json::json!({"image":{"prompt":"a portrait"}});
-        assert!(assistant_transcript_line("", Some(&meta2)).contains("a portrait"));
+        // image turn WITHOUT a caption: bare marker, never a prompt fallback
+        let meta2 = serde_json::json!({"image":{"prompt":"a very long english image prompt"}});
+        let line2 = assistant_transcript_line("", Some(&meta2));
+        assert_eq!(
+            line2, "（发送了一张图片）",
+            "bare marker when caption absent: {line2}"
+        );
+
+        // blank caption counts as absent
+        let meta3 = serde_json::json!({"image":{"prompt":"x","caption":"  "}});
+        assert_eq!(
+            assistant_transcript_line("", Some(&meta3)),
+            "（发送了一张图片）"
+        );
 
         // plain text turn: content passes through unchanged
         assert_eq!(assistant_transcript_line("hi there", None), "hi there");
 
         // metadata present but no image key: content passes through
-        let meta3 = serde_json::json!({"tip": 5});
-        assert_eq!(assistant_transcript_line("hello", Some(&meta3)), "hello");
+        let meta4 = serde_json::json!({"tip": 5});
+        assert_eq!(assistant_transcript_line("hello", Some(&meta4)), "hello");
+    }
+
+    /// Codex-review P2 regression (PR #216): the current turn is already
+    /// persisted when the transcript is built, so it always occupies the
+    /// newest fetched slot before being excluded — fetching exactly the window
+    /// size left 7 prior messages while `[近期图片]` told the judge it counted
+    /// 8. Seeds exactly 8 prior rows whose OLDEST is an image turn: with the
+    /// off-by-one that image fell out of the window and the count read 0.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn transcript_window_covers_the_full_advertised_eight(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // 8 prior rows, oldest first at now()-8min … now()-1min. Row 0 (the
+        // oldest, exactly 8th-most-recent prior) is the image turn.
+        for i in 0..8i32 {
+            let (role, content, meta) = if i == 0 {
+                (
+                    "assistant",
+                    "",
+                    Some(serde_json::json!({"image":{"prompt":"x","caption":"在沙滩"}})),
+                )
+            } else if i % 2 == 1 {
+                ("user", "文字消息", None)
+            } else {
+                ("assistant", "文字回复", None)
+            };
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5))",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(meta)
+            .bind(8 - i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let chat_repo = ChatRepo { pool: &pool };
+        let current = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let t = build_input_filter_transcript(&chat_repo, session_id, current).await;
+        assert_eq!(
+            t.images_in_window, 1,
+            "the 8th-most-recent prior message is an image and must be counted: {t:?}"
+        );
+        assert!(
+            !t.last_assistant_is_image,
+            "the newest assistant row is text: {t:?}"
+        );
+        assert_eq!(
+            t.transcript.lines().count(),
+            8,
+            "the judge must see the full advertised 8 prior messages: {}",
+            t.transcript
+        );
+        assert!(
+            !t.transcript.contains("hi"),
+            "the current turn must be excluded: {}",
+            t.transcript
+        );
+    }
+
+    /// Channel-marked rows (voice / product_qa) are out of companion context:
+    /// they must neither render in the transcript nor count as images. Pins
+    /// the exclusion the counting facts now silently depend on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn transcript_excludes_channel_rows_from_text_and_counts(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '普通消息', now() - interval '3 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A voice-channel image row: out of companion context entirely.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, channel, sent_at) \
+             VALUES ($1, 'assistant', '语音旁路', '{\"image\":{\"prompt\":\"v\"}}', 'voice', now() - interval '2 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'assistant', '', '{\"image\":{\"prompt\":\"y\",\"caption\":\"在天台\"}}', now() - interval '1 minute')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let current = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000D",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let t = build_input_filter_transcript(&chat_repo, session_id, current).await;
+        assert_eq!(
+            t.images_in_window, 1,
+            "the voice-channel image row must not count: {t:?}"
+        );
+        assert!(
+            t.last_assistant_is_image,
+            "the newest COMPANION assistant row is the image turn: {t:?}"
+        );
+        assert!(
+            !t.transcript.contains("语音旁路"),
+            "channel rows must not render: {}",
+            t.transcript
+        );
+        assert!(t.transcript.contains("普通消息"), "{}", t.transcript);
+    }
+
+    /// Build a `JudgeTranscript` from (role, content, metadata) triples,
+    /// exercising the same folding logic the DB path uses.
+    fn judge_transcript_from_parts(
+        rows: &[(&str, &str, Option<serde_json::Value>)],
+    ) -> JudgeTranscript {
+        let mut acc = JudgeTranscriptAcc::default();
+        for (role, content, meta) in rows {
+            acc.push(role, content, meta.as_ref());
+        }
+        acc.finish()
+    }
+
+    #[test]
+    fn judge_transcript_counts_images_and_last_flag() {
+        // 3 assistant rows, 2 of them image turns, newest one an image.
+        let rows = vec![
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"a"}})),
+            ),
+            ("assistant", "just text", None),
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"b"}})),
+            ),
+        ];
+        let t = judge_transcript_from_parts(&rows);
+        assert_eq!(t.images_in_window, 2);
+        assert!(t.last_assistant_is_image);
+    }
+
+    #[test]
+    fn judge_transcript_last_flag_false_when_newest_is_text() {
+        let rows = vec![
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"a"}})),
+            ),
+            ("assistant", "just text", None),
+        ];
+        let t = judge_transcript_from_parts(&rows);
+        assert_eq!(t.images_in_window, 1);
+        assert!(!t.last_assistant_is_image, "newest assistant row is text");
+    }
+
+    #[test]
+    fn judge_transcript_empty_is_zero() {
+        let t = judge_transcript_from_parts(&[]);
+        assert_eq!(t.images_in_window, 0);
+        assert!(!t.last_assistant_is_image);
+        assert_eq!(t.transcript, "");
+    }
+
+    #[test]
+    fn pde_ctx_renders_recent_image_facts_in_messages_not_turns() {
+        let input = fixture_decision_input();
+        let t = JudgeTranscript {
+            transcript: "用户：hi\nMia：hey".into(),
+            images_in_window: 2,
+            last_assistant_is_image: true,
+        };
+        let ctx = build_pde_ctx(&t, &input, true, None);
+        assert!(
+            ctx.contains("[近期图片] 最近8条消息内已发图=2 张；上一条 AI 消息是图片=是"),
+            "facts line must render with a message-based unit: {ctx}"
+        );
+        assert!(
+            ctx.contains("以本行计数为准"),
+            "the override clause must render: {ctx}"
+        );
+        // The unit must NOT claim turns — the window is rows.
+        assert!(!ctx.contains("轮内已发图"), "unit must not say 轮: {ctx}");
+    }
+
+    #[test]
+    fn pde_ctx_renders_recent_image_facts_negative_case() {
+        let input = fixture_decision_input();
+        let t = JudgeTranscript {
+            transcript: "用户：hi".into(),
+            images_in_window: 0,
+            last_assistant_is_image: false,
+        };
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(
+            ctx.contains("[近期图片] 最近8条消息内已发图=0 张；上一条 AI 消息是图片=否"),
+            "the negative case is a signal too and must always render: {ctx}"
+        );
     }
 
     #[test]
@@ -4456,6 +5088,33 @@ mod tests {
     }
 
     #[test]
+    fn image_capability_requires_a_configured_composer() {
+        use eros_engine_llm::model_config::ModelConfig;
+        // Executor present (request carries an `image` block) but no composer task.
+        let no_composer =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").expect("parses");
+        assert!(
+            !image_capability_available(true, &no_composer),
+            "no composer task ⇒ no image capability: nothing can write a prompt"
+        );
+        // Composer configured ⇒ capability follows the executor.
+        let with_composer =
+            ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
+                .expect("parses");
+        assert!(image_capability_available(true, &with_composer));
+        assert!(
+            !image_capability_available(false, &with_composer),
+            "no executor ⇒ no capability, unchanged"
+        );
+        // A variant-shaped filter_prompt is still a configured composer.
+        let variants = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"X\" }\n",
+        )
+        .expect("parses");
+        assert!(image_capability_available(true, &variants));
+    }
+
+    #[test]
     fn guard_product_qa_available_passes_unavailable_degrades() {
         let a = pde_test_affinity();
         let s = sigs(50, None);
@@ -4476,7 +5135,6 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec![],
-            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -4507,7 +5165,6 @@ mod tests {
             &input,
             acted,
             hints.clone(),
-            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -5658,7 +6315,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -5695,7 +6351,8 @@ data: [DONE]\n\n";
             .expect("meta present");
         assert_eq!(action, FrameActionType::ReplyImage);
         assert!(model.is_none(), "delegated meta carries no model");
-        // image_request: face ref + base64 composed wire prompt containing the subject.
+        // image_request: face ref + base64 composed wire prompt (no composer
+        // configured and no seed left ⇒ portrait fallback: style preset only).
         let (composed_b64, image_ref) = frames
             .iter()
             .find_map(|f| match f {
@@ -5717,13 +6374,15 @@ data: [DONE]\n\n";
             )
             .unwrap()
         };
-        assert!(
-            composed.contains("a beach at sunset"),
-            "composed wire prompt should contain the subject: {composed}"
+        assert_eq!(
+            composed,
+            eros_engine_llm::model_config::STYLE_REALISTIC,
+            "no composer configured and no seed ⇒ portrait fallback (style preset only): {composed}"
         );
 
-        // Persistence: minimal marker only (seed subject under `prompt`), and NOT
-        // the composed wire prompt / model / generation_id / url.
+        // Persistence: minimal marker only (empty subject under `prompt`,
+        // portrait fallback), and NOT the composed wire prompt / model /
+        // generation_id / url.
         let meta_row: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
@@ -5735,8 +6394,8 @@ data: [DONE]\n\n";
         .unwrap();
         let img = meta_row.expect("assistant row has metadata")["image"].clone();
         assert_eq!(
-            img["prompt"], "a beach at sunset",
-            "marker keeps the seed subject"
+            img["prompt"], "",
+            "no compose configured and no seed ⇒ empty subject (portrait fallback)"
         );
         assert!(img.get("model").is_none(), "marker must not store a model");
         assert!(
@@ -5747,7 +6406,7 @@ data: [DONE]\n\n";
         assert_ne!(
             img["prompt"],
             serde_json::json!(composed),
-            "the composed wire prompt must not be persisted (only the seed subject)"
+            "the composed wire prompt (style preset) must not be persisted as the marker subject"
         );
     }
 
@@ -5764,11 +6423,12 @@ data: [DONE]\n\n";
     /// returns `None` for an unconfigured task, so there is no config-side gate
     /// to lean on here. A longer message (e.g. "draw me", 7 chars) clears the
     /// length gate, and because `ReplyImage` proxies the assistant text with
-    /// `plan.image_prompt` (non-blank here), it would also clear the
-    /// empty-assistant gate — so the eval call fires, racing the test's
-    /// `mock.received_requests()` against a `tokio::spawn`ed task. Keeping the
-    /// content short makes "the composer is the only possible call" true by
-    /// construction, not by scheduling luck.
+    /// `plan.image_caption` — falling back to a generic marker when the
+    /// caption is absent, so the proxy text is always non-blank — it would
+    /// also clear the empty-assistant gate — so the eval call fires, racing
+    /// the test's `mock.received_requests()` against a `tokio::spawn`ed task.
+    /// Keeping the content short makes "the composer is the only possible
+    /// call" true by construction, not by scheduling luck.
     async fn run_variant_turn(
         pool: &PgPool,
         prompt_variant: Option<&str>,
@@ -5838,7 +6498,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     prompt_variant: prompt_variant.map(str::to_string),
                     ..Default::default()
                 }),
@@ -5853,14 +6512,132 @@ data: [DONE]\n\n";
         (reqs, frames)
     }
 
+    /// Codex-review P1 regression (PR #216): a forced image turn with the PDE
+    /// judge DISABLED must still fetch the history transcript. The composer
+    /// generates from the recent scene now that no seed exists, so leaving the
+    /// transcript fetch keyed on `resolved_pde.is_some()` alone would hand the
+    /// composer `[最近场景]\n（无）` on every judge-less deployment — silently
+    /// stripping its main context. Rule-based `pde::decide` never picks image
+    /// actions, so `force_image` is the only judge-less image path and the one
+    /// this pins.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_without_pde_still_feeds_the_scene(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // A prior exchange the composer's scene must carry.
+        for (role, content) in [
+            ("user", "我们明天去天台看日落吧"),
+            ("assistant", "好呀，我先去踩个点"),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Composer configured, judge NOT — `resolve_pde()` is None, so before
+        // the fix the transcript was never fetched on this path.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("天台看日落"),
+            "the composer's scene must carry the prior exchange: {payload}"
+        );
+        assert!(
+            !payload.contains("[最近场景]\n（无）"),
+            "the scene must not be empty when history exists: {payload}"
+        );
+    }
+
     /// `image.prompt_variant = "b"` must send variant b's text as the
     /// composer's system message — proof the wire value reaches
     /// `PromptSpec::select`.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn prompt_variant_selects_the_configured_composer_prompt(pool: PgPool) {
         use wiremock::ResponseTemplate;
-        // 500 on every call: the composer fails open to the seed subject. This
-        // test asserts on what was SENT, so the response body is irrelevant.
+        // 500 on every call: the composer fails open to an empty subject —
+        // there is no seed left to fall back to. This test asserts on what was
+        // SENT, so the response body is irrelevant.
         let (reqs, _frames) = run_variant_turn(&pool, Some("b"), ResponseTemplate::new(500)).await;
         assert_eq!(
             reqs.len(),
@@ -5877,7 +6654,7 @@ data: [DONE]\n\n";
         );
 
         // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
-        // the audit keys, and `prompt` is the seed subject as before.
+        // the audit keys, and `prompt` is the empty subject (portrait fallback).
         let meta: serde_json::Value = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
         )
@@ -5885,51 +6662,46 @@ data: [DONE]\n\n";
         .await
         .expect("assistant image row persisted");
         let img = meta["image"].as_object().expect("image marker present");
-        assert_eq!(img["prompt"], "a beach at sunset");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("compose_variant").is_none());
         assert!(img.get("compose_model").is_none());
         assert!(img.get("compose_generation_id").is_none());
     }
 
-    /// `prompt_variant = "raw"` must make ZERO provider calls and pass the seed
-    /// subject through to the wire prompt verbatim.
+    /// `prompt_variant = "raw"` used to be a reserved wire escape that skipped
+    /// the composer entirely. That escape is gone (#212 Task 6): with no seed
+    /// to draw verbatim, `"raw"` is an ordinary variant name. `run_variant_turn`
+    /// configures only `a` and `b`, so `"raw"` is a miss like any unconfigured
+    /// key — the composer still runs, on the built-in prompt.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn prompt_variant_raw_skips_the_composer(pool: PgPool) {
+    async fn prompt_variant_raw_falls_back_to_builtin_when_unconfigured(pool: PgPool) {
         use wiremock::ResponseTemplate;
-        // 500 on every call: "raw" must make no call at all, so the response
-        // body is irrelevant — this only proves ZERO requests were sent.
-        let (reqs, frames) = run_variant_turn(&pool, Some("raw"), ResponseTemplate::new(500)).await;
+        // 500 on every call: the composer fails open to an empty subject —
+        // there is no seed left to fall back to. This test asserts on what was
+        // SENT, so the response body is irrelevant.
+        let (reqs, _frames) =
+            run_variant_turn(&pool, Some("raw"), ResponseTemplate::new(500)).await;
+        assert_eq!(
+            reqs.len(),
+            1,
+            "\"raw\" no longer skips the composer — it still makes the one provider call"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        assert_eq!(body["messages"][0]["role"], "system");
+        let sent = body["messages"][0]["content"]
+            .as_str()
+            .expect("system content is a string");
+        assert_ne!(sent, "PROMPT_A");
+        assert_ne!(sent, "PROMPT_B");
         assert!(
-            reqs.is_empty(),
-            "raw must make no composer call, got {} request(s)",
-            reqs.len()
+            sent.contains("You compose the image for a picture"),
+            "unconfigured \"raw\" key must fall back to the built-in prompt, got {sent}"
         );
 
-        let composed_b64 = frames
-            .iter()
-            .find_map(|f| match f {
-                ProtocolFrame::ImageRequest {
-                    composed_prompt, ..
-                } => Some(composed_prompt.clone()),
-                _ => None,
-            })
-            .expect("image_request present");
-        let composed = {
-            use base64::Engine as _;
-            String::from_utf8(
-                base64::engine::general_purpose::STANDARD
-                    .decode(&composed_b64)
-                    .unwrap(),
-            )
-            .unwrap()
-        };
-        assert!(
-            composed.contains("a beach at sunset"),
-            "raw must pass the seed subject through: {composed}"
-        );
-
-        // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
-        // the audit keys, and `prompt` is the seed subject as before.
+        // Same fail-open shape as a configured-variant compose failure: no
+        // successful compose ⇒ none of the audit keys, and `prompt` is the
+        // empty subject (portrait fallback).
         let meta: serde_json::Value = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
         )
@@ -5937,16 +6709,20 @@ data: [DONE]\n\n";
         .await
         .expect("assistant image row persisted");
         let img = meta["image"].as_object().expect("image marker present");
-        assert_eq!(img["prompt"], "a beach at sunset");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("compose_variant").is_none());
         assert!(img.get("compose_model").is_none());
         assert!(img.get("compose_generation_id").is_none());
     }
 
-    /// Spec 2026-08-02: a SUCCESSFUL composer call persists the audit trio to
-    /// `metadata.image` — the selected variant key, the served model, and the
-    /// generation id — while `prompt` keeps the SEED subject (the composed
-    /// text goes only on the wire).
+    /// Spec 2026-08-02 (revised): a SUCCESSFUL composer call persists the
+    /// audit trio to `metadata.image` — the selected variant key, the served
+    /// model, and the generation id — AND `prompt` now carries the composer's
+    /// subject, not the pre-compose seed. The original design pinned `prompt`
+    /// to the seed to keep the DB row short; that job now belongs to
+    /// `caption`, so `prompt` is free to reflect what the composer actually
+    /// decided. The composed WIRE prompt (style preset + appearance + this
+    /// subject) is still never persisted — it goes out on the wire only.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_success_persists_audit_trio(pool: PgPool) {
         use wiremock::ResponseTemplate;
@@ -5962,9 +6738,9 @@ data: [DONE]\n\n";
         .await;
         assert_eq!(reqs.len(), 1, "composer is the only provider call");
 
-        // final-review finding — this is the only place the
-        // `ComposeOutcome.text → wire` seam is pinned; the DB `prompt` stays
-        // the seed by design (asserted below).
+        // The composer's plain-text reply ("ENRICHED SUBJECT", no JSON) parses
+        // as the whole reply becoming `prompt` with no caption (migration
+        // fallback) — so both the wire and the DB below carry it.
         let composed_b64 = frames
             .iter()
             .find_map(|f| match f {
@@ -5998,12 +6774,75 @@ data: [DONE]\n\n";
         .expect("assistant image row persisted");
         let img = &meta["image"];
         assert_eq!(
-            img["prompt"], "a beach at sunset",
-            "seed subject, not the composed text"
+            img["prompt"], "ENRICHED SUBJECT",
+            "prompt is the composer's subject, not the pre-compose seed"
         );
         assert_eq!(img["compose_variant"], "b");
         assert_eq!(img["compose_model"], "served/model");
         assert_eq!(img["compose_generation_id"], "gen-xyz");
+    }
+
+    /// Sibling of `compose_success_persists_audit_trio`, but the mock composer
+    /// returns real JSON (`{"prompt":..., "caption":...}`) instead of plain
+    /// text, so `caption` is actually populated end to end. Proves the seam
+    /// neither the parser unit tests (`parse_compose_reply`) nor the marker
+    /// unit tests (`assistant_transcript_line` / `model_facing_assistant_text`)
+    /// exercise on their own: a real composer reply persists `caption` to the
+    /// row, and both history-facing renders surface it — never the prompt.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_success_with_json_caption_surfaces_in_both_renders(pool: PgPool) {
+        use wiremock::ResponseTemplate;
+        let (reqs, _frames) = run_variant_turn(
+            &pool,
+            Some("b"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-cap",
+                "model": "served/model",
+                "choices": [{"message": {"content":
+                    r#"{"prompt":"on a rooftop at dusk","caption":"在天台看夕阳"}"#
+                }}],
+            })),
+        )
+        .await;
+        assert_eq!(reqs.len(), 1, "composer is the only provider call");
+
+        // sqlx::test gives this test its own database — the one assistant row
+        // is the image turn's.
+        let row: eros_engine_store::chat::ChatMessage =
+            sqlx::query_as("SELECT * FROM engine.chat_messages WHERE role = 'assistant'")
+                .fetch_one(&pool)
+                .await
+                .expect("assistant image row persisted");
+
+        let img = &row.metadata.as_ref().expect("metadata present")["image"];
+        assert_eq!(img["prompt"], "on a rooftop at dusk");
+        assert_eq!(
+            img["caption"], "在天台看夕阳",
+            "composer's caption persisted"
+        );
+
+        // Both history-facing renders surface the caption, never the prompt.
+        let content = row.content.clone();
+        let metadata = row.metadata.clone();
+        let transcript_line = assistant_transcript_line(&content, metadata.as_ref());
+        assert!(
+            transcript_line.contains("在天台看夕阳"),
+            "judge transcript surfaces the caption: {transcript_line}"
+        );
+        assert!(
+            !transcript_line.contains("rooftop"),
+            "the prompt must never reach the judge transcript: {transcript_line}"
+        );
+
+        let model_text = crate::pipeline::handlers::model_facing_assistant_text(row);
+        assert!(
+            model_text.contains("在天台看夕阳"),
+            "chat history surfaces the caption: {model_text}"
+        );
+        assert!(
+            !model_text.contains("rooftop"),
+            "the prompt must never reach the chat model's history: {model_text}"
+        );
     }
 
     /// Spec 2026-08-02-provider-body-params: an [[providers.openrouter.body]]
@@ -6080,7 +6919,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6182,7 +7020,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     // default mode = TextImage ⇒ ReplyTextImage
-                    image_prompt: Some("in a red dress".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6243,7 +7080,8 @@ data: [DONE]\n\n";
         assert_eq!(action, FrameActionType::ReplyTextImage);
 
         // The minimal marker was MERGED onto the assistant TEXT row (content
-        // non-empty), carrying only the seed subject.
+        // non-empty), carrying only the empty subject (no composer configured
+        // and no seed left ⇒ portrait fallback).
         let row: (String, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT content, metadata FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
@@ -6255,13 +7093,228 @@ data: [DONE]\n\n";
         .unwrap();
         assert!(!row.0.is_empty(), "the text reply row has content");
         let img = row.1.expect("row has metadata")["image"].clone();
-        assert_eq!(img["prompt"], "in a red dress");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("model").is_none(), "marker must not store a model");
         assert!(
             img.get("generation_id").is_none(),
             "marker must not store a generation id"
         );
         assert!(img.get("url").is_none(), "marker must not store a url");
+    }
+
+    /// Review finding (2026-08-02, issue #212 fix wave): the sibling test above
+    /// configures NO `chat_image_prompt_compose` task, so the concurrently
+    /// spawned compose task resolves `None` and returns instantly — the join
+    /// at the end of the burst is trivially satisfied and proves nothing about
+    /// ordering under a REAL in-flight call. This test configures the composer
+    /// AND gives its mocked response a delay that outlasts the (instant, mocked)
+    /// chat burst, so the join at `compose_handle.join().await`
+    /// genuinely waits on a still-running task — the actual race the concurrent
+    /// spawn in `run_stream` is meant to survive. Asserts the wire frame order
+    /// still holds (`meta → delta* → done → image_request → final`) and that
+    /// the `image_request` frame plus the persisted marker carry the racing
+    /// composer's real output, not the empty-subject portrait fallback.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_concurrent_composer_races_chat_burst(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Chat burst: streams back immediately, no delay. The composer mock
+        // below is delayed well past this, so by the time `run_stream` reaches
+        // the join point the compose task is still in flight — the join must
+        // actually wait on it rather than observe an already-resolved handle.
+        let chat_body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        // Route the two calls by the MODEL ID present in the request body so the
+        // two mocks are MUTUALLY EXCLUSIVE (mount order/precedence cannot matter):
+        // chat call body contains "primary"; composer call body contains "composer".
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(150))
+                    .set_body_json(serde_json::json!({
+                        "id": "gen-compose-race",
+                        "model": "served/composer-model",
+                        "choices": [{"message": {"content":
+                            r#"{"prompt":"CONCURRENT COMPOSED SUBJECT","caption":"并发合成的图片"}"#
+                        }}],
+                    })),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9222222222222222222222A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    // default mode = TextImage ⇒ ReplyTextImage
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "reply_text_image makes exactly two provider calls: chat + composer, {reqs:?}"
+        );
+
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        // meta(reply_text_image) → delta* → done → image_request → final,
+        // preserved even though the composer is still running when the chat
+        // burst's `done` frame is emitted.
+        assert_eq!(types.first().map(String::as_str), Some("meta"), "{types:?}");
+        assert_eq!(types.last().map(String::as_str), Some("final"), "{types:?}");
+        assert!(
+            types.iter().any(|t| t == "delta"),
+            "text burst delta present: {types:?}"
+        );
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request present");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done even with a real in-flight composer: {types:?}"
+        );
+        assert_eq!(
+            types[ir_pos + 1],
+            "final",
+            "image_request immediately before final"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| t.as_str() == "image_request")
+                .count(),
+            1,
+            "exactly one image_request"
+        );
+
+        // The image_request frame carries the COMPOSER'S output (the wire
+        // prompt embeds the enriched subject) — not the empty-subject portrait
+        // fallback the no-composer sibling test exercises.
+        let composed_b64 = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt, ..
+                } => Some(composed_prompt.clone()),
+                _ => None,
+            })
+            .expect("image_request present");
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("CONCURRENT COMPOSED SUBJECT"),
+            "composed wire prompt must carry the racing composer's subject, got {composed}"
+        );
+
+        // The marker MERGED onto the assistant text row carries the composer's
+        // actual subject/caption/audit trio — proof the join actually picked up
+        // the still-in-flight task's result rather than racing past it.
+        let row: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!row.0.is_empty(), "the text reply row has content");
+        let img = row.1.expect("row has metadata")["image"].clone();
+        assert_eq!(img["prompt"], "CONCURRENT COMPOSED SUBJECT");
+        assert_eq!(img["caption"], "并发合成的图片");
+        assert_eq!(img["compose_model"], "served/composer-model");
+        assert_eq!(img["compose_generation_id"], "gen-compose-race");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -10240,6 +11293,26 @@ data: [DONE]\n\n";
         }
     }
 
+    fn fixture_decision_input() -> eros_engine_core::types::DecisionInput {
+        use eros_engine_core::types::{DecisionInput, Event};
+        DecisionInput {
+            event: Event::UserMessage {
+                content: "在吗".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                history_anchor: Default::default(),
+            },
+            affinity: test_affinity(),
+            persona: test_persona(),
+            signals: test_signals(),
+        }
+    }
+
     #[test]
     fn persona_brief_renders_all_fields() {
         let mut p = test_persona(); // name = "Mia"
@@ -10294,7 +11367,11 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true, None);
+        let t = JudgeTranscript {
+            transcript: "用户：hi\nMia：hey".into(),
+            ..Default::default()
+        };
+        let ctx = build_pde_ctx(&t, &input, true, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
         assert!(
@@ -10346,7 +11423,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("", &input, false, None);
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -10366,17 +11443,21 @@ data: [DONE]\n\n";
     #[test]
     fn pde_ctx_renders_product_qa_blocks_only_when_enabled() {
         let input = pde_test_input();
+        let t = JudgeTranscript {
+            transcript: "t".into(),
+            ..Default::default()
+        };
         // feature off → no lines at all
-        let off = build_pde_ctx("t", &input, true, None);
+        let off = build_pde_ctx(&t, &input, true, None);
         assert!(!off.contains("[产品咨询]"));
         assert!(!off.contains("[最近产品咨询]"));
         // on, no history → availability line only
-        let on_empty = build_pde_ctx("t", &input, true, Some(""));
+        let on_empty = build_pde_ctx(&t, &input, true, Some(""));
         assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
         assert!(!on_empty.contains("[最近产品咨询]"));
         // on, with history → both blocks, before [用户最新消息]
         let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
-        let on_recent = build_pde_ctx("t", &input, true, Some(&recent));
+        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent));
         assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
         assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
@@ -10390,7 +11471,7 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 7, "all seven properties required: {v}");
+        assert_eq!(req.len(), 6, "all six properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
@@ -10413,6 +11494,33 @@ data: [DONE]\n\n";
             actions.iter().any(|x| x == "product_qa"),
             "product_qa in action enum: {v}"
         );
+    }
+
+    #[test]
+    fn pde_response_format_has_no_image_prompt() {
+        let f = pde_response_format();
+        let schema = &f["json_schema"]["schema"];
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v == "image_prompt"),
+            "the judge must not be asked for an image prompt: {required:?}"
+        );
+        assert!(
+            schema["properties"].get("image_prompt").is_none(),
+            "image_prompt must be gone from properties"
+        );
+        // The two enums the judge still owns stay.
+        assert!(schema["properties"].get("image_ref").is_some());
+        assert!(schema["properties"].get("aspect_ratio").is_some());
+    }
+
+    #[test]
+    fn parse_pde_verdict_ignores_stray_image_prompt() {
+        // A non-strict provider may still emit the old key; it must not break parsing.
+        let j = r#"{"action":"reply_image","inner_state":"x","image_prompt":"leftover","image_ref":"previous","aspect_ratio":"9:16"}"#;
+        let v = parse_pde_verdict(j).expect("verdict parses despite the stray key");
+        assert_eq!(v.action, PdeAction::ReplyImage);
+        assert_eq!(v.aspect_ratio.as_deref(), Some("9:16"));
     }
 
     fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {
@@ -11905,9 +13013,11 @@ data: [DONE]\n\n"
 
     #[test]
     fn delegated_marker_preserves_image_awareness() {
-        // Seed subject under `prompt` (the key assistant_transcript_line reads),
-        // plus aspect — and NOTHING else (no composed prompt / model / gen id).
-        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"), None, None, None);
+        // Subject under `prompt` (persisted, but NOT what
+        // `assistant_transcript_line` reads — see below), plus aspect — and
+        // NOTHING else (no caption / composed prompt / model / gen id).
+        let marker =
+            build_delegated_image_marker("beach at sunset", None, Some("3:4"), None, None, None);
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
         assert_eq!(
@@ -11915,18 +13025,26 @@ data: [DONE]\n\n"
             2,
             "marker must be minimal"
         );
-        // The §5 regression guard: transcript still annotates it as a prior image.
+        // The §5 regression guard: transcript still annotates it as a prior
+        // image. With no caption, that annotation is the bare marker — the
+        // subject/aspect do NOT surface (caption contract: never fall back
+        // to `prompt`).
         let wrapped = serde_json::json!({ "image": marker });
         let line = assistant_transcript_line("", Some(&wrapped));
-        assert!(line.contains("beach at sunset"), "subject surfaced: {line}");
-        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_eq!(
+            line, "（发送了一张图片）",
+            "bare marker when caption absent: {line}"
+        );
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
-        // No aspect => still a valid one-key marker that annotates.
-        let m2 = build_delegated_image_marker("a portrait", None, None, None, None);
+        // No aspect => still a valid one-key marker that annotates (bare, same reason).
+        let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None);
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
-        assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
+        assert_eq!(
+            assistant_transcript_line("", Some(&w2)),
+            "（发送了一张图片）"
+        );
     }
 
     /// Spec 2026-08-02: a successful composer call adds exactly three audit
@@ -11935,6 +13053,7 @@ data: [DONE]\n\n"
     fn delegated_marker_carries_compose_audit_when_present() {
         let m = build_delegated_image_marker(
             "beach at sunset",
+            None,
             Some("3:4"),
             Some("b"),
             Some("served/model"),
@@ -11948,8 +13067,14 @@ data: [DONE]\n\n"
         assert_eq!(m.as_object().unwrap().len(), 5);
 
         // No generation id from the provider → key absent, not null.
-        let m2 =
-            build_delegated_image_marker("beach at sunset", None, None, Some("served/model"), None);
+        let m2 = build_delegated_image_marker(
+            "beach at sunset",
+            None,
+            None,
+            None,
+            Some("served/model"),
+            None,
+        );
         assert_eq!(m2["compose_model"], "served/model");
         assert!(m2
             .as_object()
