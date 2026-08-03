@@ -115,7 +115,7 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 
 兩個原因：
 
-1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 68 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
+1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 69 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
 2. **可嵌入性。** 任何想在這個基礎上做別的產品的人——日記式 agent、語言教練、教練類陪伴——可以只拉 `core` 進來，不用繼承 HTTP 的形狀、Postgres schema、JWT auth。六維好感度模型才是別人最想拿走的部份；我們把這件事做成輕巧的。
 
 ## 文件結構

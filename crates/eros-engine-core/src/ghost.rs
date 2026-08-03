@@ -41,7 +41,10 @@ pub fn ghost_permitted(a: &Affinity, s: GhostSignals) -> bool {
 }
 
 /// Decide whether to ghost: hard-safety protections (via `ghost_permitted`),
-/// then the score threshold (rises to 0.85 after a recent ghost, else 0.65).
+/// then the score threshold — 0.85 once this session has ghosted at all, else
+/// 0.65. The raised bar does NOT decay: the branch only asks whether
+/// `hours_since_last_ghost` is `Some`, and `last_ghost_at` is set-only (never
+/// cleared), so one ghost raises the bar for the rest of that session.
 pub fn decide(a: &Affinity, s: GhostSignals) -> GhostDecision {
     if !ghost_permitted(a, s) {
         return GhostDecision::Reply;
@@ -130,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn raised_threshold_after_recent_ghost_blocks_mid_score() {
+    fn raised_threshold_after_prior_ghost_blocks_mid_score() {
         // ghost_score = (1-0.5)*0.4 + (1-0.5)*0.4 + 0.0*0.2 = 0.4
         // base 0.65 → would NOT ghost; post-ghost 0.85 → would NOT ghost
         let a = aff(0.5, 0.5, 0.0, 1);
@@ -151,6 +154,31 @@ mod tests {
             hours_since_last_ghost: Some(2.0),
         };
         assert_eq!(decide(&a, s), GhostDecision::Reply);
+    }
+
+    #[test]
+    fn raised_threshold_never_decays_with_time() {
+        // Same affinity as `ghost_when_score_above_threshold_post_protection`
+        // (score 0.82, ghosts at the 0.65 base threshold), but this session has
+        // ghosted before — a month ago. 0.82 < 0.85, so it still must not ghost.
+        //
+        // Pins the property the docs state: the branch tests only
+        // `hours_since_last_ghost.is_some()`, with no upper cutoff, and
+        // `last_ghost_at` is never cleared — so the bar stays raised for the
+        // life of the session. A decay window added here would silently make
+        // ghost-mechanics.md wrong.
+        let a = aff(0.1, 0.1, 0.5, 0);
+        for hours in [2.0, 24.0, 720.0] {
+            let s = GhostSignals {
+                message_count: 50,
+                hours_since_last_ghost: Some(hours),
+            };
+            assert_eq!(
+                decide(&a, s),
+                GhostDecision::Reply,
+                "score 0.82 must stay below the raised 0.85 bar at {hours}h"
+            );
+        }
     }
 
     #[test]
