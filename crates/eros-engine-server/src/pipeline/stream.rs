@@ -1337,7 +1337,7 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 // ── run_output_filter ────────────────────────────────────────────────────────
 
 /// Per-model timeout for a single filter LLM call.
-const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Max wait for a chat stream to OPEN (connect + queue + response headers).
 /// A provider that accepts the socket but never sends headers must not hold
@@ -2387,7 +2387,7 @@ async fn run_input_filter(
 /// Assemble the composer's user message from the appearance, recent scene,
 /// latest user message, style, and aspect ratio. Pure (kept separate so it is
 /// testable without a network call).
-fn compose_user_payload(
+pub(crate) fn compose_user_payload(
     appearance: &str,
     recent_scene: &str,
     latest_user_msg: &str,
@@ -2417,7 +2417,7 @@ struct ComposeReply {
 /// is now usually empty), just bare markers until the prompt is updated.
 ///
 /// A blank caption is normalised to `None`; callers must not persist `""`.
-fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
+pub(crate) fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
     let parsed = serde_json::from_str::<ComposeReply>(raw).ok().or_else(|| {
         super::find_json_block(raw).and_then(|b| serde_json::from_str::<ComposeReply>(b).ok())
     });
@@ -2436,20 +2436,20 @@ fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
 /// A SUCCESSFUL composer call's result: the picture subject, the short caption
 /// for history-facing renders, plus the audit values persisted to
 /// `metadata.image` (spec 2026-08-02). Mirrors `VisionOutcome`.
-struct ComposeOutcome {
-    prompt: String,
+pub(crate) struct ComposeOutcome {
+    pub(crate) prompt: String,
     /// One short line describing what the picture shows, for the chat history
     /// and the judge transcript. `None` when the model gave none — including
     /// when the reply wasn't JSON at all (the migration fallback in
     /// `parse_compose_reply`, where the whole reply becomes `prompt` instead).
-    caption: Option<String>,
+    pub(crate) caption: Option<String>,
     /// Model that actually answered: `resp.model`, falling back to the
     /// attempted model id (same idiom as the vision audit).
-    model: String,
-    generation_id: Option<String>,
+    pub(crate) model: String,
+    pub(crate) generation_id: Option<String>,
     /// `ResolvedImagePromptCompose::variant_key`, carried so the call site
     /// doesn't need the resolved config in scope.
-    variant: Option<String>,
+    pub(crate) variant: Option<String>,
 }
 
 /// Generate the image prompt (and its caption) via the optional composer LLM.
@@ -2457,7 +2457,11 @@ struct ComposeOutcome {
 /// returns the parsed prompt/caption plus the audit trio on first success, or
 /// `None` (caller falls back to an empty subject — the portrait path). Never
 /// blocks or fails the image turn. Mirrors `run_input_filter`.
-async fn run_image_prompt_compose(
+///
+/// Shared with `routes/persona.rs`: the standalone compose endpoint's
+/// non-stream mode maps a `None` here to a 502 instead of the chat path's
+/// fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
+pub(crate) async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -3185,19 +3189,15 @@ pub fn run_stream(
 
         // Forced-image override — wins over the PDE/ghost result. Applied AFTER
         // the kill-switch so a client-forced image is never suppressed to ghost.
-        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. There
-        // is no subject to carry through here — the composer decides what the
-        // picture shows from turn context alone (`resolve_image_turn_inputs`).
+        // Always ReplyImage: image only, no text reply (spec 2026-08-03 §1) —
+        // the ReplyImage/ReplyTextImage split belongs to the judge, which the
+        // consumer has overridden by forcing. There is no subject to carry
+        // through here — the composer decides what the picture shows from turn
+        // context alone (`resolve_image_turn_inputs`).
         if force_image {
-            let action = match req_image.map(|i| &i.mode) {
-                Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
-                    ActionType::ReplyImage
-                }
-                _ => ActionType::ReplyTextImage,
-            };
             plan = pde::plan_for(
                 &input,
-                action,
+                ActionType::ReplyImage,
                 plan.context_hints.clone(),
                 plan.reply_tone.clone(),
                 eros_engine_core::types::ImageRef::Face,
@@ -6314,7 +6314,6 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
-                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6497,7 +6496,6 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
-                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
                     prompt_variant: prompt_variant.map(str::to_string),
                     ..Default::default()
                 }),
@@ -6602,7 +6600,6 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
-                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6918,7 +6915,6 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
-                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6947,25 +6943,47 @@ data: [DONE]\n\n";
     async fn reply_text_image_appends_image_request_and_marker(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
-        use wiremock::matchers::path as wm_path;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // The text reply streams from this mock (≥ MIN_FILTERED_OUTPUT_CHARS so it
-        // is not degraded as too-short). The delegated image path makes NO extra
-        // (draw) call; a draw would reuse this endpoint, but the frame-sequence
-        // assertions below leave no room for an extra frame between
-        // `image_request` and `final`.
+        // The judge picks reply_text_image — `force` can only produce
+        // reply_image now (spec 2026-08-03 §1), so the judge is the only road
+        // to the text+image action. The text reply streams from the chat mock
+        // (≥ MIN_FILTERED_OUTPUT_CHARS so it is not degraded as too-short).
+        // The delegated image path makes NO extra (draw) call; a draw would
+        // reuse this endpoint, but the frame-sequence assertions below leave
+        // no room for an extra frame between `image_request` and `final`.
+        // The three mocks are routed by MODEL ID so they are mutually
+        // exclusive (mount order/precedence cannot matter).
         let mock = MockServer::start().await;
         let body = "\
 data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
 data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
 data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
                     .set_body_raw(body, "text/event-stream"),
             )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"pde/judge\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
+        // Composer: configured (guard_action keeps the judge's image action
+        // only when the task exists) but FAILING — 500 on the whole chain, so
+        // the compose fails open to an empty subject and the marker stays
+        // empty exactly as the assertions below pin.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
             .mount(&mock)
             .await;
 
@@ -6975,7 +6993,9 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.chat_companion]\nmodel = \"primary\"\n",
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
             )
             .unwrap(),
         );
@@ -7017,11 +7037,11 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
-                image: Some(crate::routes::companion_stream::ImageReplyParams {
-                    force: true,
-                    // default mode = TextImage ⇒ ReplyTextImage
-                    ..Default::default()
-                }),
+                // Presence of the image block signals "consumer handles images
+                // this turn"; with the composer task configured, guard_action
+                // keeps the judge's reply_text_image. NOT forced — force now
+                // means reply_image (spec 2026-08-03 §1).
+                image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 history_anchor: Default::default(),
             },
             None,
@@ -7080,8 +7100,8 @@ data: [DONE]\n\n";
         assert_eq!(action, FrameActionType::ReplyTextImage);
 
         // The minimal marker was MERGED onto the assistant TEXT row (content
-        // non-empty), carrying only the empty subject (no composer configured
-        // and no seed left ⇒ portrait fallback).
+        // non-empty), carrying only the empty subject (the composer chain
+        // failed ⇒ fail-open empty-subject portrait fallback; no seed left).
         let row: (String, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT content, metadata FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
@@ -7103,12 +7123,12 @@ data: [DONE]\n\n";
     }
 
     /// Review finding (2026-08-02, issue #212 fix wave): the sibling test above
-    /// configures NO `chat_image_prompt_compose` task, so the concurrently
-    /// spawned compose task resolves `None` and returns instantly — the join
-    /// at the end of the burst is trivially satisfied and proves nothing about
-    /// ordering under a REAL in-flight call. This test configures the composer
-    /// AND gives its mocked response a delay that outlasts the (instant, mocked)
-    /// chat burst, so the join at `compose_handle.join().await`
+    /// gives the composer a failing (500) mock, so the concurrently spawned
+    /// compose task returns almost instantly — the join at the end of the
+    /// burst is trivially satisfied and proves nothing about ordering under a
+    /// REAL in-flight call. This test gives the composer's mocked response a
+    /// delay that outlasts the (instant, mocked) chat burst, so the join at
+    /// `compose_handle.join().await`
     /// genuinely waits on a still-running task — the actual race the concurrent
     /// spawn in `run_stream` is meant to survive. Asserts the wire frame order
     /// still holds (`meta → delta* → done → image_request → final`) and that
@@ -7158,6 +7178,16 @@ data: [DONE]\n\n";
             )
             .mount(&mock)
             .await;
+        // Judge: instant reply_text_image verdict — the only road to the
+        // text+image action now that `force` always means reply_image.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"pde/judge\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -7166,6 +7196,7 @@ data: [DONE]\n\n";
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
                  [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
             )
             .unwrap(),
@@ -7208,11 +7239,11 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
-                image: Some(crate::routes::companion_stream::ImageReplyParams {
-                    force: true,
-                    // default mode = TextImage ⇒ ReplyTextImage
-                    ..Default::default()
-                }),
+                // Presence of the image block signals "consumer handles images
+                // this turn"; with the composer task configured, guard_action
+                // keeps the judge's reply_text_image. NOT forced — force now
+                // means reply_image (spec 2026-08-03 §1).
+                image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 history_anchor: Default::default(),
             },
             None,
@@ -7223,8 +7254,8 @@ data: [DONE]\n\n";
         let reqs = mock.received_requests().await.expect("recorded requests");
         assert_eq!(
             reqs.len(),
-            2,
-            "reply_text_image makes exactly two provider calls: chat + composer, {reqs:?}"
+            3,
+            "reply_text_image makes exactly three provider calls: judge + chat + composer, {reqs:?}"
         );
 
         let types: Vec<String> = frames

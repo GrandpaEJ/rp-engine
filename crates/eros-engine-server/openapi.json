@@ -779,6 +779,102 @@
         }
       }
     },
+    "/persona/{instance_id}/image/compose": {
+      "post": {
+        "tags": [
+          "persona"
+        ],
+        "operationId": "compose_image",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id (must belong to the JWT user)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "With `stream: false`, one JSON body (ComposeResponse). With `stream: true` (the default), `text/event-stream`: `delta` frames carrying the composer's raw output verbatim, then one terminal `done` frame whose payload minus the `type` discriminator is byte-identical to the `stream: false` body — or a single in-band `error` frame after streaming has begun.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "instance not found"
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "composer chain exhausted before any output — `{\"error\": \"upstream\", \"message\": …}`. No portrait fallback: this endpoint has no chat turn to protect."
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/world/town/{user_id}/feed": {
       "get": {
         "tags": [
@@ -1404,6 +1500,87 @@
           }
         }
       },
+      "ComposeRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same allow-list as the chat path."
+          },
+          "content": {
+            "type": "string",
+            "description": "Lands in the `[对方最新消息]` slot. Required, non-empty after trim."
+          },
+          "prompt_variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same `filter_prompt` variant selection as the chat path, including the\nunknown-key-falls-back-to-built-in rule."
+          },
+          "scene": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lands in the `[最近场景]` slot. Omitted or blank ⇒ `（无）`. A composer\n*input*, not the prompt: the engine never copies it into\n`composed_prompt` — only the composer's own output is assembled. That\nis a routing property, not sanitization: the composer is a language\nmodel reading caller-supplied text, so it can be steered by this slot\nand can echo it back through the deltas and `subject`. Treat the output\nas model-generated, not as trusted."
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Default `true` (spec 2026-08-03 §1)."
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same three presets as the chat path; default `realistic`."
+          }
+        }
+      },
+      "ComposeResponse": {
+        "type": "object",
+        "description": "The five fields both modes return (`stream: true` carries them on the\nterminal `done` frame, byte-identical minus the `type` discriminator).",
+        "required": [
+          "composed_prompt",
+          "subject",
+          "model"
+        ],
+        "properties": {
+          "caption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The composer's short caption; `null` when it produced none."
+          },
+          "composed_prompt": {
+            "type": "string",
+            "description": "Style preset + persona appearance + subject — the string to hand an\nimage vendor."
+          },
+          "generation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For reconciling against provider logs."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that actually answered."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The composer's own prompt field, before assembly. A successful-but-\nnon-JSON composer reply becomes this whole field (spec §3.5)."
+          }
+        }
+      },
       "CreateCommentRequest": {
         "type": "object",
         "required": [
@@ -1561,16 +1738,9 @@
           }
         }
       },
-      "ImageMode": {
-        "type": "string",
-        "enum": [
-          "text_image",
-          "image_only"
-        ]
-      },
       "ImageReplyParams": {
         "type": "object",
-        "description": "Per-turn image parameters. Presence of this block signals the consumer\nhandles images this turn (it drives image-action availability). The engine\ncomposes the prompt and emits a single `image_request` frame — it never\ndraws on the chat stream.\n\nReference-image URLs travel on the `image_request` frame; the engine\nnever draws, so there is no engine-side draw request carrying them.",
+        "description": "Per-turn image parameters. Presence of this block signals the consumer\nhandles images this turn (it drives image-action availability). The engine\ncomposes the prompt and emits a single `image_request` frame — it never\ndraws on the chat stream.\n\n`force = true` overrides the judge and makes the turn `reply_image` —\nimage only, no text reply. `content` follows the ordinary non-empty rule\non forced turns, and forcing requires `[tasks.chat_image_prompt_compose]`\nto be configured (422 otherwise). A leftover `mode` key from the pre-1.0.1\ncontract deserializes and is silently ignored (spec 2026-08-03 §1).\n\nReference-image URLs travel on the `image_request` frame; the engine\nnever draws, so there is no engine-side draw request carrying them.",
         "properties": {
           "aspect_ratio": {
             "type": [
@@ -1580,9 +1750,6 @@
           },
           "force": {
             "type": "boolean"
-          },
-          "mode": {
-            "$ref": "#/components/schemas/ImageMode"
           },
           "prompt_variant": {
             "type": [
