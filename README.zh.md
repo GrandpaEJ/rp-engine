@@ -66,9 +66,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.9"
-eros-engine-store = "0.9"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.9"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "1.0"
+eros-engine-store = "1.0"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "1.0"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` 有意不发布到 crates.io——请使用 Docker 镜像运行（见下文）。
@@ -78,7 +78,7 @@ eros-engine-llm   = "0.9"   # only if you want the OpenRouter + Voyage clients
 每个 `v*` tag 都会将 `eros-engine-server` 的多架构镜像（`linux/amd64` + `linux/arm64`）发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.9.3
+docker pull ghcr.io/etherfunlab/eros-engine:1.0.0
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ docker pull ghcr.io/etherfunlab/eros-engine:latest
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.9.3 serve
+  ghcr.io/etherfunlab/eros-engine:1.0.0 serve
 ```
 
 构建此镜像使用的正是 `docker/Dockerfile`，可将其部署到任意容器托管平台。请参阅[部署](docs/deploying.zh.md)。

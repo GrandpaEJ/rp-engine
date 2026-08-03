@@ -90,9 +90,9 @@ If you don't need the HTTP layer — say you're building a different product on 
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.9"
-eros-engine-llm   = "0.9"
-eros-engine-store = "0.9"
+eros-engine-core  = "1.0"
+eros-engine-llm   = "1.0"
+eros-engine-store = "1.0"
 ```
 
 (To track unreleased work, use `{ git = "https://github.com/etherfunlab/eros-engine", branch = "main" }` instead.)
