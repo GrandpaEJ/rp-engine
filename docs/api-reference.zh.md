@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.6.x",
+  "version": "1.0.x",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
@@ -52,6 +52,18 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 `is_new=false` 表示同一用戶用同一個 `genome_id` 再調 `/start`——引擎恢復已有 session 而不是建重複的。
+
+可选的 `channel` 字段：`"text"`（默认）或 `"voice"`。开新/恢复是按频道隔离的
+——语音频道的 start 永远不会恢复一个文本 session，反之亦然。语音客户端必须先
+在这里用 `"channel": "voice"` 拿到 session，才能去调语音轮次端点。
+
+可选的 `instance_id` 字段：显式指定 `persona_instance` id。缺省时服务器为
+所给 `genome_id` 挑选（或自动创建）该用户的 instance；仅当 `instance_id`
+缺省时 `genome_id` 才是必填。
+
+可选的 `is_demo` 字段：把新建的 session 标记为 demo。持久化到 session 的
+`metadata.is_demo`，好感度管线读它来用 `demo_ema_inertia` 替代全局值，
+让好感度条在 demo 的轮次预算内有可见的移动。恢复已有 session 时忽略。
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
@@ -86,7 +98,7 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
-- **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后，可能省略）、`generation_id`（可选的 OpenRouter id）。
+- **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。
 - **`final`** —— 本轮汇总：`lead_score`、`should_show_cta`、`agent_training_level`，外加 `filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。
 
 每个用户最多 3 条并发活跃流。保活心跳（`: ping`）每 15 秒发一次，
@@ -173,6 +185,25 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "client_msg_id": "01J3333333333333333333333A",
         "memory_scope": "full",
         "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**可选：回复锚点（回卷）。** 请求体可附加 `reply_to_message_id` ——
+本 session 内某条 `chat_messages` 行的 UUID，把本轮上下文锚定到那条消息。
+解析成功时，历史回卷到（且包含）那条消息：晚于它发送的行不进入 prompt，
+锚点记录在落库的用户行的 `metadata.reply_to_message_id` 上。传了但解析
+不到（id 不存在，或属于别的 session）不会让请求失败——本轮丢弃历史
+（上下文里只剩当前这条消息），并在该行的 `metadata.reply_to_error` 写入
+`"not_found"`。省略该字段即为正常的最新历史行为。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "等等，说回之前那个计划",
+        "client_msg_id": "01J3333333333333333333333A",
+        "reply_to_message_id": "3cc06c53-9d2e-4f8a-b3c1-0a1b2c3d4e5f"
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
@@ -294,9 +325,9 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
 
-### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
+### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
-分頁讀消息歷史，最新在前。
+分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。
 
 ```json
 {
@@ -313,6 +344,42 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
 外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。
 
+## 语音
+
+### `POST /comp/voice/{session_id}/turn/stream`
+
+精简的语音频道轮次：进来一条转写好的用户话，出去一条流式文本回复。STT 和 TTS
+完全是调用方的事，引擎从不碰音频（见
+[voice-call parts 设计文档](superpowers/specs/2026-07-07-voice-call-parts-design.md)）。
+
+返回 `text/event-stream`，帧集合更小：`delta`* 之后接一个终结的 `done`，或者
+单独一个 `error`——帧的形状与上面的聊天消息流一致，但**没有** `meta` 帧，也没有
+`action_type`。
+
+session 必须是**语音频道** session（否则 `409 wrong_channel`）——通过
+`POST /comp/chat/start` 带 `"channel": "voice"` 拿到。语音是每个部署自行选择
+开启的：model config 里没有 `[tasks.chat_voice]` 块时，该端点返回
+`501 voice_disabled`。
+
+prompt 刻意做得很薄：人格 + 语音指令 + 一行由该 session 好感度推导出的关系描述
+（bond/chemistry 档位）。不做向量召回，不带记忆，不带 traits/scopes 等较大的上下文块。
+
+Body 字段：
+
+- `content` —— 用户说的那句话。最长 4096 字符。
+- `client_msg_id` —— 26..36 个 ASCII 可打印字符（任意 UUID 或 ULID）。同一组
+  `(session_id, client_msg_id)` 重放会返回 `409 duplicate`，而不是再生成一条
+  回复。
+- `relationship_scope`（可选）—— 本轮注入关系描述的哪几半：`"none"`、`"bond"`、
+  `"chemistry"`、`"both"`（默认 `"both"`）。解析后的取值记录在 assistant 行的
+  `metadata.relationship_scope` 上。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
 ## 用戶畫像
 
 ### `GET /comp/chat/{user_id}/sessions`
@@ -321,21 +388,22 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 ### `GET /comp/user/{user_id}/profile`
 
-當前的 `companion_insights` JSONB 加上加權的 `training_level`。同樣的 `user_id` 等值檢查。
+當前的 `companion_insights` JSONB 加上加權的 `agent_training_level`。同樣的 `user_id` 等值檢查。
 
 ```json
 {
-  "insights": {
+  "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "companion_insights": {
     "city": "Hong Kong",
     "occupation": "graphic designer",
     "interests": ["jazz", "long walks"],
     "mbti_guess": "INFP"
   },
-  "training_level": 0.42
+  "agent_training_level": 0.42
 }
 ```
 
-`training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
+`agent_training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
 
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）
@@ -471,6 +539,15 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 最近一次用户轮次的好感度 delta（post-EMA），供前端做逐轮观测。与
 canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
 `EXPOSE_AFFINITY_DEBUG` 控制（这块归前端所有）——但仍做 JWT + ownership 检查。
+
+查询参数（均可选）：
+
+- `after` —— 长轮询基线：调用方手上已有的 `event_id`。只要该 session 最新的
+  用户轮事件仍等于它（或还没有任何事件），请求就被挂起，直到有更新的事件落库
+  或 `wait` 超时——超时响应返回未变的状态，形状与立即返回路径相同。缺省 ⇒
+  立即返回最新事件。
+- `wait` —— 请求最长挂起多少毫秒。仅在带 `after` 时有意义。默认 10000，
+  服务端上限 25000。
 
 ```json
 {

@@ -50,7 +50,7 @@ fallback_temperature = 0.5
 fallback_max_tokens  = 200
 
 [tasks.<name>]
-model        = "<provider>/<model-id>"      # required; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
+model        = "<provider>/<model-id>"      # optional — absent falls through to [defaults].fallback_model, then the compiled-in default; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
@@ -83,12 +83,13 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `defaults.fallback_model` | `String` | 否 | 任务配置未提供 model 时使用的最终 fallback。若仍然缺失，代码使用编译时内置默认值 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 优先级相同；编译时内置默认值为 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 优先级相同；编译时内置默认值为 `200`。 |
-| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。参见“主模型选择”。 |
+| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 否 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。缺失（或为空）时依次回退到 `defaults.fallback_model`、编译时内置默认值——`[tasks.<name>]` 块不写 `model` key 也能正常解析并启动。例外：`[tasks.chat_voice]` 块一旦存在，`model` 必须是单一固定且非空的 id，否则拒绝启动。参见“主模型选择”。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主调用失败时由 `OpenRouterClient` 使用的次要模型。 |
+| `tasks.<name>.retry_depth` | `u32` | 否 | 把解析出的 `fallback` 链截断：primary + 最多这么多个 fallback，之后的条目永远不会被尝试。默认值：走通用 `resolve()` 的任务为 `2`（含 `chat_companion`；可按 tier 覆盖），单一用途任务为 `1`——参见“Fallback 截断（`retry_depth`）”。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 每任务的 token 上限。无 per-tier 覆盖。 |
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
-| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
+| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
@@ -401,9 +402,15 @@ Regex 过滤在所有其他处理之前运行：
 
 仅当至少一条规则实际改变了回复时才会设置这些列（与 LLM filter 行为一致——无变更的过滤不会设置这些列）。
 
-#### 空结果 fail-safe
+#### 只剩 artifact 的回复 ⇒ 空气泡
 
-若某次过滤会将非空回复变为空字符串，则该次过滤为**空操作**——原始回复原样交付，审计列不被设置。此机制防止过于宽泛的 pattern 让伴侣陷入沉默。
+当回复**整体**就是一个 artifact 时（例如一个裸的
+`[你给对方发送了一张照片：…]`，别无其它内容），strip 会把它清空。**没有
+fail-safe**：客户端**收不到任何内容气泡**（不发 delta），该行落库时 `content`
+为空字符串（`""`），审计列照样会被设置（`pre_filter_content` = 过滤前的原始
+回复，`filter_model` = `"<regex>"`）。空/NULL 回复怎么渲染由下游客户端自己
+决定——参考 web 客户端直接不显示，效果类似已读不回，反而更容易让用户追问
+（更像跟真人聊天）。
 
 #### `filtered` 标志
 
@@ -428,14 +435,14 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 | 名称 | 使用方 | 状态 |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completion；tip 轮次使用相同的 reply 路径） | live |
+| `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion；tip 轮次使用相同的 reply 路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights`（事实挖掘 + JSONB 合并） | live |
-| `chat_output_filter` | `pipeline::handlers::ReplyHandler`（交付前对 chat 回复进行可选的二次改写） | live |
+| `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
-| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动，见 issue #210） | live |
+| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -469,6 +476,20 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
+
+**近期图片上下文行。** 判断器上下文里同样恒定带一行
+`[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`。
+该数量由引擎按已落库的消息行统计，判断器无需自行去对话记录里清点图片标记；括号
+里那句要求模型以本行为准。统计窗口是最近 **8 行**，不是 8 轮。自定义
+`filter_prompt` 无论是否引用该信息都会收到这一行；下游若有覆盖层需要解析它，请
+原样保留这个 token 串。
+
+**`structured_output` 字段**（bool，默认 `true`）：判断器调用会带
+`response_format` JSON-schema 约束。如果你的供应商或模型不接受这个参数（有些会
+直接返 HTTP 400），把 `structured_output = false` 关掉——引擎会退回到只在 prompt
+里要求 JSON，解析方式不变。`[tasks.world_director]`、
+`[tasks.world_stories_director]`、`[tasks.world_comment]` 也有这个字段，默认值
+相同。
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
 
@@ -762,9 +783,15 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 
 选择 primary 后，解析出的 `fallback` 链中与其 id 完全相同的条目会被删除——重试刚刚失败的模型毫无意义。对于 round-robin/weighted primary，这是动态行为：只删除当前调用所选的 id。
 
-## 稳定性承诺（OSS 0.x）
+### Fallback 截断（`retry_depth`）
 
-在 `0.x` 期间，OSS 引擎承诺：
+去重之后，链会被截断到 `retry_depth` 条——每次调用先试 primary，再最多试 `retry_depth` 个 fallback，截断点之后的条目永远不会被尝试。`retry_depth` 可在任务级设置，在两个 tier 感知任务上还可按 tier 覆盖（tier > 任务默认块）。
+
+默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`chat_product_qa`、`chat_image_prompt_compose`）用 `1`（primary + 第一个 fallback）。
+
+## 稳定性承诺
+
+以下承诺立于 `0.x` 期间，并**原样延续到 `1.x`**。在 `1.x` 期间，OSS 引擎承诺：
 
 1. **不删除字段。** `[defaults]` 和 `[tasks.<name>]` 中现有的字段名不会消失。
    （目前的例外，均已在上文记录：`[tasks.embedding].dimensions`——已移除，

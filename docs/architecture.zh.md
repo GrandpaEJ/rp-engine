@@ -40,12 +40,16 @@ PDE 決策                eros_engine_core::pde::decide(&input) → ActionPlan
                          companion_decision_events）
        │
        ▼
-handler 分派            Reply  → ReplyHandler  構建 ChatRequest
-                        Ghost  → GhostHandler  返回 None（不調 LLM）
-                        Proact → ProactiveHandler
+action 分派             run_stream 里的 inline `match plan.action_type`：
+                        Ghost     → 标记该行 ghosted + record_ghost（不调 LLM）
+                        ProductQa → 独立的产品问答执行器
+                        其余      → 回复路径构建 ChatRequest
        │
        ▼
 chat 執行               若有 ChatRequest：state.openrouter.execute(req).await?
+                        （reply_text_image：图片合成器在 chat 调用前就已
+                         tokio::spawn，文本回复流完后才 join——合成这一跳
+                         藏在 chat 调用下面）
                         經 ChatRepo 寫入 assistant 消息
        │
        ▼
@@ -53,18 +57,22 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         - affinity 寫入（LLM 評估 6 維 Δ → DB）
                         - memory   （Voyage embed → pgvector upsert）
                         - insight  （LLM 抽事實 → companion_insights 合併）
+                        - lead-score 刷新（insights → chat_sessions.lead_score）
+                        （四个 future 经 tokio::join! 并发执行）
 ```
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
-其中三个是有条件可用的：`reply_image` 和 `reply_text_image` 都要求请求带
-`image` 块；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM PDE
-已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
+其中三个是有条件可用的：`reply_image` 和 `reply_text_image` **同时**要求请求带
+`image` 块**且** `[tasks.chat_image_prompt_compose]` 已配置——判断器不再写
+image-prompt 种子之后，合成器是唯一能产出图片 prompt 的东西，缺了这个任务
+图片轮次就不可用；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM
+PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
 `product_qa` 会短路整条伴侣链路（不注入人格 prompt、不跑 post-process）：
-它路由到一个独立的产品问答执行器，而不是 `ReplyHandler`。各动作的启用
-门槛见 [model-config.zh.md](model-config.zh.md)。
+它路由到一个独立的产品问答执行器，而不是回复路径。各动作的启用门槛见
+[model-config.zh.md](model-config.zh.md)。
 
 ## Auth
 
@@ -96,7 +104,7 @@ eros-engine-server :8080
                        companion_decision_events
 ```
 
-post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
+post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight / lead-score 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
 
 **`chat_messages.channel`**：`NULL` = 普通文本；`'voice'` = 语音频道；
 `'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在伴侣上下文与记忆之外
@@ -107,7 +115,7 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 
 兩個原因：
 
-1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 25 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
+1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 68 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
 2. **可嵌入性。** 任何想在這個基礎上做別的產品的人——日記式 agent、語言教練、教練類陪伴——可以只拉 `core` 進來，不用繼承 HTTP 的形狀、Postgres schema、JWT auth。六維好感度模型才是別人最想拿走的部份；我們把這件事做成輕巧的。
 
 ## 文件結構
@@ -120,6 +128,7 @@ crates/
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
+│       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/
@@ -127,7 +136,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0028_companion_decision_events
+│   ├── migrations/           # 0000_schema → 0039_world_worldviews
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -141,7 +150,7 @@ crates/
         ├── state.rs          # AppState（pool / auth / openrouter / voyage / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
-        ├── pipeline/         # mod（編排器）/ handlers / post_process
+        ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
         ├── routes/           # health / companion / companion_stream / debug / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
