@@ -454,9 +454,7 @@ fn parse_affinity_eval(
     String,
 ) {
     use eros_engine_core::affinity::AffinityDeltas;
-    let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
-        .ok()
-        .or_else(|| super::find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
+    let parsed: Option<LlmAffinityEval> = super::parse_llm_json(raw);
     let Some(e) = parsed else {
         return (AffinityDeltas::default(), None, String::new());
     };
@@ -920,9 +918,7 @@ async fn extract_facts(
     };
 
     // Parse once; distinguish parse_error (no JSON at all) from empty/ok.
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .or_else(|| super::find_json_block(&raw).and_then(|b| serde_json::from_str(b).ok()));
+    let parsed = super::parse_llm_json::<serde_json::Value>(&raw);
     match parsed {
         Some(v) => {
             let facts = extract_facts_array(&v);
@@ -1069,6 +1065,7 @@ async fn refresh_lead_score(state: &AppState, session_id: Uuid, user_id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::companion::testutil::seed_persona_instance;
     use uuid::Uuid;
 
     #[test]
@@ -1840,7 +1837,7 @@ mod tests {
         let state = crate::routes::companion::test_state(pool.clone());
 
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
@@ -1955,7 +1952,7 @@ mod tests {
         use eros_engine_store::affinity::AffinityRepo;
 
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
