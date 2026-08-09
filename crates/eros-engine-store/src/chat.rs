@@ -934,7 +934,10 @@ impl<'a> ChatRepo<'a> {
     /// `channel = 'voice'` and skips all replay/ghost machinery. Returns
     /// which case occurred — `Duplicate` when `client_msg_id` was already
     /// seen (existing row's id), `Inserted` (fresh row's id) otherwise — so
-    /// callers can refuse to regenerate a reply for a duplicate.
+    /// callers can refuse to regenerate a reply for a duplicate. Bumps
+    /// `last_active_at` only on the `Inserted` branch — a `Duplicate` replay
+    /// must not bump, or it would reorder sibling-session selection for a
+    /// later feature.
     pub async fn insert_voice_user_message(
         &self,
         session_id: Uuid,
@@ -946,6 +949,7 @@ impl<'a> ChatRepo<'a> {
         // migration 0012) — DO NOTHING and fall through to reading the existing id,
         // so concurrent duplicates are classified reliably (the loser gets
         // Duplicate, never a unique-violation 500).
+        let mut tx = self.pool.begin().await?;
         let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
              VALUES ($1, 'user', $2, $3, 'voice') \
@@ -955,9 +959,16 @@ impl<'a> ChatRepo<'a> {
         .bind(session_id)
         .bind(content)
         .bind(client_msg_id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(id) = inserted {
+            // Bump only on a fresh insert. A `Duplicate` replay must NOT bump —
+            // it would reorder sibling-session selection for a later feature.
+            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Ok(VoiceUserInsert::Inserted(id));
         }
         // Conflict → a row with this (session_id, client_msg_id) already exists.
@@ -970,14 +981,16 @@ impl<'a> ChatRepo<'a> {
         )
         .bind(session_id)
         .bind(client_msg_id)
-        .fetch_one(self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(VoiceUserInsert::Duplicate(existing))
     }
 
     /// Persist an assistant turn on the voice channel: `role='assistant'`,
     /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
-    /// continues_from — voice replies are single, whole messages.
+    /// continues_from — voice replies are single, whole messages. Bumps
+    /// `last_active_at` in the same transaction as the insert.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_voice_assistant_message(
         &self,
@@ -991,6 +1004,7 @@ impl<'a> ChatRepo<'a> {
         truncated: bool,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO engine.chat_messages \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
@@ -1006,8 +1020,13 @@ impl<'a> ChatRepo<'a> {
         .bind(usage)
         .bind(generation_id)
         .bind(metadata)
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1045,6 +1064,59 @@ impl<'a> ChatRepo<'a> {
         .execute(self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The user's most-recently-active OTHER voice session for this persona
+    /// instance — used to quote its tail into a new voice session's bootstrap
+    /// snapshot on that session's first turn. Same `(user_id, instance_id)`
+    /// pair, `channel = 'voice'`, and excludes `exclude_session_id` (the
+    /// session being bootstrapped) so a session never becomes its own
+    /// sibling. Read-only — unlike `resume_latest_session`, does NOT bump
+    /// `last_active_at`; this is a side lookup for a different session, not a
+    /// resume. Rides `idx_chat_sessions_user_instance_channel` (migration
+    /// 0031).
+    pub async fn latest_sibling_voice_session(
+        &self,
+        user_id: Uuid,
+        instance_id: Uuid,
+        exclude_session_id: Uuid,
+    ) -> Result<Option<ChatSession>, sqlx::Error> {
+        sqlx::query_as::<_, ChatSession>(
+            "SELECT * FROM engine.chat_sessions \
+             WHERE user_id = $1 AND instance_id = $2 AND channel = 'voice' AND id <> $3 \
+             ORDER BY last_active_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(exclude_session_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Write-once snapshot of a voice session's bootstrap context into
+    /// `metadata.voice_bootstrap`. Guarded by `NOT (metadata ? 'voice_bootstrap')`
+    /// so a retried pipeline step, or two concurrent first-turn requests
+    /// racing each other, can never clobber the original snapshot — the
+    /// loser's write is a no-op, not a silent overwrite. No `COALESCE` needed:
+    /// `chat_sessions.metadata` is `NOT NULL DEFAULT '{}'` (migration 0001).
+    /// Returns `rows_affected`: 1 = this call wrote the snapshot; 0 = the key
+    /// was already present (race lost, or already written on a prior turn) —
+    /// callers treat 0 as a normal no-op, not an error.
+    pub async fn set_voice_bootstrap(
+        &self,
+        session_id: Uuid,
+        snapshot: &serde_json::Value,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE engine.chat_sessions \
+             SET metadata = metadata || jsonb_build_object('voice_bootstrap', $2::jsonb) \
+             WHERE id = $1 AND NOT (metadata ? 'voice_bootstrap')",
+        )
+        .bind(session_id)
+        .bind(snapshot)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 }
 
@@ -2971,6 +3043,158 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn voice_user_insert_bumps_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+
+        // Backdate so the bump is unambiguous regardless of clock resolution.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let out = repo
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP1")
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, VoiceUserInsert::Inserted(_)),
+            "expected Inserted, got {out:?}"
+        );
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            after > before,
+            "a fresh voice user insert must bump last_active_at"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_user_insert_duplicate_does_not_bump_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+        let cmid = "01J9000000000000000000BUMP2";
+
+        let first = match repo
+            .insert_voice_user_message(session_id, "hi", cmid)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // Backdate so a stray bump on the duplicate branch would be visible.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let out = repo
+            .insert_voice_user_message(session_id, "hi again", cmid)
+            .await
+            .unwrap();
+        match out {
+            VoiceUserInsert::Duplicate(id) => assert_eq!(id, first),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "a duplicate voice user insert must NOT bump last_active_at (would reorder \
+             sibling-session selection for a replayed client_msg_id)"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_assistant_insert_bumps_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+
+        let user_message_id = match repo
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP3")
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // Backdate so the assistant-insert bump is unambiguous.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let aid: Uuid = ulid::Ulid::new().into();
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_message_id,
+            aid,
+            "hi there",
+            Some("primary"),
+            None,
+            Some("gen-1"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            after > before,
+            "a voice assistant insert must bump last_active_at"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn channel_check_accepts_product_qa_and_rejects_unknown(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let session_id = throwaway_session(&pool).await.id;
@@ -3206,5 +3430,190 @@ mod tests {
             .unwrap();
         assert!(openings.iter().all(|c| c != "这是官方说明……"));
         assert!(openings.contains(&"嗨呀".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_excludes_current_and_text_channel(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // The only session that should ever come back: an older voice
+        // session for the same user × instance.
+        let sibling = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(sibling.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Decoy: a text-channel session, more recently active than `sibling`.
+        // If the channel filter were missing, this would be picked instead.
+        let text_decoy = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "text")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(text_decoy.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Current: the voice session we exclude by id. Left at its default
+        // `now()` last_active_at — the most recent of all three — so a
+        // missing `id <> $3` filter would wrongly return it instead of
+        // `sibling`.
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|s| s.id),
+            Some(sibling.id),
+            "must exclude the current session and any text-channel session"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_orders_by_last_active_at(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let older = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(older.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let newer = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(newer.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap()
+            .expect("a sibling voice session exists");
+        assert_eq!(
+            found.id, newer.id,
+            "must return the most-recently-active sibling"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_none_when_no_sibling(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "no other voice session exists for this user × instance"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_voice_bootstrap_writes_once_then_noops(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let snapshot = serde_json::json!({
+            "tail": "上次聊到这里",
+            "prior_session_id": Uuid::new_v4().to_string(),
+        });
+
+        let rows = repo.set_voice_bootstrap(s.id, &snapshot).await.unwrap();
+        assert_eq!(rows, 1, "first write must succeed");
+
+        let loaded = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
+
+        // Second call with a DIFFERENT snapshot must no-op — the key is
+        // already present.
+        let other_snapshot = serde_json::json!({"tail": "should never be written"});
+        let rows2 = repo
+            .set_voice_bootstrap(s.id, &other_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows2, 0,
+            "second write must be a no-op (key already present)"
+        );
+
+        let loaded2 = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded2.metadata["voice_bootstrap"], snapshot,
+            "original snapshot must be preserved, not overwritten"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_voice_bootstrap_preserves_other_metadata_keys(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let s = repo
+            .create_session_with_metadata(
+                user_id,
+                instance_id,
+                serde_json::json!({"is_demo": true}),
+                "voice",
+            )
+            .await
+            .unwrap();
+
+        let snapshot = serde_json::json!({"tail": "接上次"});
+        let rows = repo.set_voice_bootstrap(s.id, &snapshot).await.unwrap();
+        assert_eq!(rows, 1);
+
+        let loaded = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.metadata["is_demo"],
+            serde_json::json!(true),
+            "pre-existing metadata keys must survive the merge"
+        );
+        assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
     }
 }

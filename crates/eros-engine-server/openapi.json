@@ -1388,6 +1388,13 @@
             ],
             "description": "Conversation channel ('text' default, or 'voice'). Passed through to\nthe canonical start; see `StartChatRequest::channel`."
           },
+          "force_new": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Skip resume and always create a fresh session. Passed through to the\ncanonical start; see `StartChatRequest::force_new`."
+          },
           "genome_id": {
             "type": [
               "string",
@@ -1919,6 +1926,13 @@
             ],
             "description": "Conversation channel for the session: `\"text\"` (default) or `\"voice\"`.\nStart/resume is channel-scoped — a voice-channel start never resumes a\ntext session and vice versa, so the two conversations stay isolated."
           },
+          "force_new": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "When `true`, skip resume entirely and always create a fresh session\n(returns `is_new: true`), even if a resumable one exists for this\nuser × instance × channel. Default `false`/omitted keeps the normal\nresume-or-create behavior. Intended for callers (e.g. voice calls)\nthat want one session per call rather than a continued conversation."
+          },
           "genome_id": {
             "type": [
               "string",
@@ -2120,6 +2134,13 @@
           },
           "content": {
             "type": "string"
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How much long-term memory this turn may use — same field name, enum,\nwire values, and default (`neutral_and_relationship`) as the chat\nstream. The first successfully-assembling turn's resolved insight\ntier is frozen into the bootstrap snapshot and never changes for the\nrest of the call."
           },
           "relationship_scope": {
             "type": [
