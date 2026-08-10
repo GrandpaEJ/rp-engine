@@ -164,12 +164,23 @@ async fn classify_session(
     // 1. Pull the conversation log. We use chat_messages (the canonical
     // turn record) rather than the formatted companion_memories rows so
     // the LLM doesn't see the "用户：X\nAI：Y" wrapper twice.
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT role, content FROM engine.chat_messages \
+    //
+    // Channel filter: text rows (`channel IS NULL`) always; voice rows too
+    // unless `DREAMING_VOICE_DISABLED` is set. Eligibility is idle-based, so
+    // a voice session only reaches here after the call ended and went quiet
+    // for `DREAMING_IDLE_SECS` — this never reads a live call. `product_qa`
+    // rows stay excluded: out-of-character product asides are not memories.
+    let channel_filter = if state.config.dreaming_voice_disabled {
+        "AND channel IS NULL"
+    } else {
+        "AND (channel IS NULL OR channel = 'voice')"
+    };
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT role, content, channel FROM engine.chat_messages \
          WHERE session_id = $1 AND role IN ('user', 'assistant') \
-           AND channel IS NULL \
-         ORDER BY sent_at",
-    )
+           {channel_filter} \
+         ORDER BY sent_at"
+    ))
     .bind(session_id)
     .fetch_all(&state.pool)
     .await
@@ -182,13 +193,36 @@ async fn classify_session(
         return Ok(0);
     }
 
+    // Voice assistant rows may carry inline TTS cues when the deployment runs
+    // `[tasks.chat_voice] tts_audio_tags = true`. Strip them here — they are
+    // stage directions, not memories. User rows and text rows pass through
+    // verbatim. A turn that strips to nothing is dropped entirely rather than
+    // contributing an empty "AI：" line.
     let turns: Vec<String> = rows
         .into_iter()
-        .map(|(role, content)| {
+        .filter_map(|(role, content, channel)| {
+            let is_voice_assistant = role == "assistant" && channel.as_deref() == Some("voice");
+            let content = if is_voice_assistant {
+                strip_audio_tags(&content)
+            } else {
+                content
+            };
+            if content.trim().is_empty() {
+                return None;
+            }
             let label = if role == "user" { "用户" } else { "AI" };
-            format!("{label}：{content}")
+            Some(format!("{label}：{content}"))
         })
         .collect();
+
+    // Everything stripped away (a call of nothing but audio tags) reduces to
+    // the empty-session case: stamp, no LLM call.
+    if turns.is_empty() {
+        mark_classified(&state.pool, session_id)
+            .await
+            .map_err(|e| format!("mark classified (empty transcript): {e}"))?;
+        return Ok(0);
+    }
 
     // 2. Single LLM call, structured-JSON output. The instruction is the
     // configured system prompt; the conversation is a separate user message.
@@ -317,6 +351,71 @@ fn normalise_category(raw: &str) -> String {
     }
 }
 
+/// Strip inline TTS audio tags from a voice assistant turn.
+///
+/// Deployments with `[tasks.chat_voice] tts_audio_tags = true` get replies
+/// carrying stage directions — `[laughs]`, `[whispers]`, `[sighs]` — that the
+/// TTS layer consumes. They are performance cues, not things the user said or
+/// the companion learned, so they never belong in extracted memory text.
+///
+/// Deliberately conservative: a tag is `[` + a non-empty run of lowercase
+/// ASCII letters and single spaces + `]` (the shape `AUDIO_TAGS_ADDENDUM`
+/// teaches, including improvised multi-word tags like `[laughs softly]`).
+/// `[Laughs]`, `[标签]`, `[3]`, `[]`, and unclosed `[` are left verbatim so
+/// literal brackets in real content survive.
+///
+/// When nothing is stripped the input is returned byte-identical — the
+/// whitespace collapse only runs on strings a tag was actually removed from.
+fn strip_audio_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut stripped = false;
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let tag = after
+            .find(']')
+            .map(|close| &after[..close])
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == ' '));
+        match tag {
+            Some(t) => {
+                out.push_str(&rest[..open]);
+                rest = &after[t.len() + 1..];
+                stripped = true;
+            }
+            None => {
+                // Not a tag — keep the '[' and continue scanning past it.
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    if !stripped {
+        return s.to_string();
+    }
+    collapse_spaces(&out)
+}
+
+/// Collapse runs of ASCII spaces into one and trim the ends. Newlines and
+/// other whitespace are preserved — only the gaps a removed tag left behind
+/// are closed up.
+fn collapse_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c == ' ' {
+            if !prev_space {
+                out.push(c);
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +514,57 @@ mod tests {
     }
 
     #[test]
+    fn strip_audio_tags_removes_a_single_tag() {
+        assert_eq!(strip_audio_tags("[laughs] 你好啊"), "你好啊");
+        assert_eq!(strip_audio_tags("你好啊 [laughs]"), "你好啊");
+    }
+
+    #[test]
+    fn strip_audio_tags_removes_interspersed_tags() {
+        assert_eq!(
+            strip_audio_tags("今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦"),
+            "今天全搞砸了 不想说了…… 骗你的啦"
+        );
+    }
+
+    #[test]
+    fn strip_audio_tags_accepts_multi_word_tags() {
+        // The addendum explicitly lets the model improvise beyond the listed
+        // vocabulary, so `[laughs softly]` must strip too.
+        assert_eq!(strip_audio_tags("好啦 [laughs softly] 别闹"), "好啦 别闹");
+    }
+
+    #[test]
+    fn strip_audio_tags_yields_empty_for_tag_only_content() {
+        assert_eq!(strip_audio_tags("[laughs]"), "");
+        assert_eq!(strip_audio_tags(" [sighs] [giggles] "), "");
+    }
+
+    #[test]
+    fn strip_audio_tags_leaves_no_doubled_spaces() {
+        assert_eq!(strip_audio_tags("a [sighs] b"), "a b");
+        assert_eq!(strip_audio_tags("a[sighs]b"), "ab");
+    }
+
+    #[test]
+    fn strip_audio_tags_keeps_non_tag_brackets() {
+        // Uppercase, CJK, digits, empty, unclosed — none of these are TTS tags.
+        assert_eq!(strip_audio_tags("[Laughs] 嗨"), "[Laughs] 嗨");
+        assert_eq!(strip_audio_tags("[标签] 嗨"), "[标签] 嗨");
+        assert_eq!(strip_audio_tags("第 [3] 章"), "第 [3] 章");
+        assert_eq!(strip_audio_tags("空 [] 括号"), "空 [] 括号");
+        assert_eq!(strip_audio_tags("[laughs 没关"), "[laughs 没关");
+    }
+
+    #[test]
+    fn strip_audio_tags_is_byte_identical_without_tags() {
+        // No tag ⇒ no whitespace collapsing either: untagged rows must be
+        // passed through untouched, doubled spaces and all.
+        let s = "我  住在   上海\n真的";
+        assert_eq!(strip_audio_tags(s), s);
+    }
+
+    #[test]
     fn system_audit_user_is_all_ones_sentinel() {
         assert_eq!(SYSTEM_AUDIT_USER, "11111111-1111-1111-1111-111111111111");
     }
@@ -481,8 +631,72 @@ mod tests {
         // configured system prompt sentinel.
     }
 
+    /// Spec 2026-08-09-voice-dreaming-ingestion §1: voice rows now reach the
+    /// extraction transcript. This test REPLACES the old
+    /// `classify_session_excludes_voice_rows` lock — the inversion is
+    /// spec-mandated, not a weakened assertion. The boundary that must not
+    /// move is pinned by `classify_session_excludes_product_qa_rows` below.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_excludes_voice_rows(pool: sqlx::PgPool) {
+    async fn classify_session_includes_voice_rows(pool: sqlx::PgPool) {
+        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
+        assert!(
+            joined.contains("VOICELINE"),
+            "voice turn must now be extracted (spec §1 flip)"
+        );
+    }
+
+    /// The boundary that must NOT move: `product_qa` is an out-of-character
+    /// product aside, never companion memory.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_excludes_product_qa_rows(pool: sqlx::PgPool) {
+        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
+        assert!(
+            !joined.contains("QALINE"),
+            "product_qa turn must stay excluded from memory extraction"
+        );
+    }
+
+    /// `DREAMING_VOICE_DISABLED=1` restores the pre-flip filter.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_excludes_voice_rows_when_flag_set(pool: sqlx::PgPool) {
+        let (mock, mut state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+        state.config.dreaming_voice_disabled = true;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(
+            joined.contains("TEXTLINE"),
+            "text turn must still be extracted"
+        );
+        assert!(
+            !joined.contains("VOICELINE"),
+            "flag on ⇒ voice turn excluded again"
+        );
+    }
+
+    /// Seed one session carrying a text turn, a voice turn, and a product_qa
+    /// turn, plus a state whose OpenRouter points at a mock returning an empty
+    /// memory list (so no embedding call is ever made).
+    async fn seed_channel_case(
+        pool: &sqlx::PgPool,
+    ) -> (
+        wiremock::MockServer,
+        crate::state::AppState,
+        Uuid,
+        Uuid,
+        Uuid,
+    ) {
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -495,29 +709,28 @@ mod tests {
             .mount(&mock)
             .await;
 
-        // Seed session with one TEXT assistant turn and one VOICE assistant turn.
         let user_id = Uuid::new_v4();
-        let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) VALUES ('V','p','{}'::jsonb) RETURNING id",
-        ).fetch_one(&pool).await.unwrap();
-        let instance_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
-        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let instance_id = seed_persona_instance(pool, user_id).await;
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
         )
         .bind(user_id)
         .bind(instance_id)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
-        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1,'user','TEXTLINE')")
-            .bind(session_id).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1,'assistant','VOICELINE','voice')")
-            .bind(session_id).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'user','TEXTLINE',NULL), \
+             ($1,'assistant','VOICELINE','voice'), \
+             ($1,'assistant','QALINE','product_qa')",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
-        // State with a memory_extraction task + mock OpenRouter.
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
@@ -532,19 +745,301 @@ mod tests {
             ),
         );
 
-        // Drive the private classify_session (same module).
-        let _ = super::classify_session(&state, session_id, user_id, Some(instance_id)).await;
+        (mock, state, session_id, user_id, instance_id)
+    }
 
-        // The request the extractor sent must contain the text turn, not the voice turn.
-        let reqs = mock.received_requests().await.unwrap();
-        let joined: String = reqs
+    /// Every request body the mock saw, concatenated — enough to assert which
+    /// sentinel lines made it into the extraction prompt.
+    async fn joined_request_bodies(mock: &wiremock::MockServer) -> String {
+        mock.received_requests()
+            .await
+            .expect("recording enabled by default")
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
-            .collect();
-        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
-        assert!(
-            !joined.contains("VOICELINE"),
-            "voice turn must be excluded from memory extraction"
+            .collect()
+    }
+
+    /// Spec §4: bracketed TTS cues on voice assistant rows never reach the
+    /// extraction prompt; user rows and non-voice rows are untouched.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_strips_audio_tags_from_voice_assistant_rows(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
+                "id": "gen-x", "model": "primary"
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'user','我 [laughs] 住在上海','voice'), \
+             ($1,'assistant','[giggles] 上海真好 [sighs] 我也想去','voice'), \
+             ($1,'assistant','[chuckles] 文字轮次',NULL)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
         );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(
+            joined.contains("上海真好 我也想去"),
+            "voice assistant row must arrive tag-free and space-collapsed; got {joined}"
+        );
+        assert!(
+            !joined.contains("giggles"),
+            "no audio tag may survive on the voice assistant row"
+        );
+        assert!(
+            joined.contains("我 [laughs] 住在上海"),
+            "user rows are never stripped"
+        );
+        assert!(
+            joined.contains("[chuckles] 文字轮次"),
+            "non-voice assistant rows are never stripped"
+        );
+    }
+
+    /// A call whose every turn is tag-only leaves nothing to extract: stamp,
+    /// no LLM call — the same path a genuinely empty session takes.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_stamps_without_llm_when_all_turns_strip_empty(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
+                "id": "gen-x", "model": "primary"
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'assistant','[laughs]','voice'), ($1,'assistant','[sighs] [giggles]','voice')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let written = classify_session(&state, session_id, user_id, Some(instance_id))
+            .await
+            .expect("classify ok");
+        assert_eq!(written, 0);
+        assert!(
+            joined_request_bodies(&mock).await.is_empty(),
+            "nothing left to extract ⇒ no LLM call"
+        );
+        let stamped: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamped.is_some(), "session must still be stamped");
+    }
+
+    /// 512-dim unit vector — matches the column dimension the migrations set.
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    /// An `EmbeddingRouter` whose backend is a wiremock server, built through
+    /// the production `from_config_with` path (custom provider + its
+    /// `<NAME>_API_KEY`). Mirrors the helper in `pipeline::voice`'s tests.
+    async fn embed_router_mock() -> (
+        wiremock::MockServer,
+        eros_engine_llm::embedding::EmbeddingRouter,
+    ) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": unit_embedding(1) } ] }),
+            ))
+            .mount(&server)
+            .await;
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            server.uri()
+        ))
+        .expect("embedding provider config parses");
+        let router = eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+        })
+        .expect("mock embedding router builds");
+        (server, router)
+    }
+
+    /// Full path: an ended (idle) voice call becomes categorized profile-layer
+    /// memories and is stamped; a call that is still warm is not swept.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_ingests_idle_voice_session_and_skips_active_one(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let llm = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content":
+                    "{\"memories\":[{\"content\":\"用户住在上海\",\"category\":\"fact\"}]}" } }],
+                "id": "gen-e2e", "model": "primary"
+            })))
+            .mount(&llm)
+            .await;
+        let (_embed_server, embed) = embed_router_mock().await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", llm.uri()),
+            ),
+        );
+        state.embed = std::sync::Arc::new(embed);
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // Ended call: last_active_at two hours ago.
+        let ended: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
+             VALUES ($1,$2,'voice', now() - interval '2 hours') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Live call: active right now.
+        let live: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
+             VALUES ($1,$2,'voice', now()) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for sid in [ended, live] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+                 ($1,'user','我住在上海','voice'), ($1,'assistant','[giggles] 上海不错','voice')",
+            )
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let processed = scan_and_classify(
+            &state,
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .expect("sweep ok");
+        assert_eq!(processed, 1, "only the ended call is eligible");
+
+        // Profile layer == `instance_id IS NULL` (there is no `layer` column;
+        // see `MemoryRepo::upsert`, which forces instance_id to NULL for
+        // MemoryLayer::Profile).
+        let rows: Vec<(String, Option<String>, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT content, category, session_id, instance_id \
+             FROM engine.companion_memories WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one extracted candidate ⇒ one memory row");
+        assert_eq!(rows[0].0, "用户住在上海");
+        assert_eq!(rows[0].1.as_deref(), Some("fact"));
+        assert_eq!(rows[0].2, ended, "memory is attributed to the ended call");
+        assert!(rows[0].3.is_none(), "profile layer ⇒ instance_id NULL");
+
+        let ended_stamp: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(ended)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_stamp.is_some(), "ended call stamped");
+        let live_stamp: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(live)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(live_stamp.is_none(), "live call must not be swept mid-call");
     }
 }
