@@ -16,14 +16,13 @@ Two supported paths, in order of effort:
 
 ## Subcommands
 
-The binary has five modes (dispatched by `argv[1]`):
+The binary has four modes (dispatched by `argv[1]`):
 
 | Subcommand | Purpose |
 |------------|---------|
 | `serve` (default) | Run the HTTP server on `BIND_ADDR` |
 | `migrate` | Apply pending sqlx migrations and exit |
 | `seed-personas [dir]` | Read every `*.toml` in `[dir]` (default `/etc/eros-engine/personas` — the examples baked into the Docker image) and upsert as a persona genome |
-| `backfill-human-insights` | One-off projection of every `companion_insights` row into `engine.human_insights` (idempotent; manual only) |
 | `print-openapi` | Dump the OpenAPI spec to stdout and exit (no DB, no env; used by the CI drift check) |
 
 `seed-personas` is idempotent — re-runs update existing rows in place (matched by `name`), preserving UUIDs and FK references in `persona_instances`.
@@ -275,5 +274,5 @@ call. Details, data model, and the boot-validation rules are in
 ## Source
 
 - `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
-- `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the five modes above)
+- `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the four modes above)
 - [`.env.example`](../.env.example) — operational env-var list (details in this guide)

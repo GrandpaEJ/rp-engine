@@ -17,13 +17,13 @@
 //! - Routes that operate on a `session_id` verify that the session belongs
 //!   to the JWT user; otherwise 403 Forbidden.
 //! - All DB I/O routes through the `eros-engine-store` repos
-//!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `InsightRepo`).
+//!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `HumanInsightRepo`).
 //! - The credit ledger is gone in OSS — tipping is handled inline on the
 //!   streaming `/message/stream` path via `tips_amount_usd`, not through a
 //!   separate credit-spending endpoint.
-//! - `lead_score` / CTA-gating fields are computed from the same store
-//!   primitives used by post-process; no inline `companion_insights`
-//!   table read.
+//! - `/comp/user/{user_id}/profile` returns the flat, typed `human_insights`
+//!   row (city/occupation/interests/... — see `ProfileResponse`), not the
+//!   legacy freeform `companion_insights` JSON blob.
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -38,7 +38,7 @@ use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
-use eros_engine_store::insight::{compute_training_level, InsightRepo};
+use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
@@ -130,7 +130,6 @@ pub struct HistoryResponse {
 pub struct SessionListEntry {
     pub session_id: Uuid,
     pub instance_id: Option<Uuid>,
-    pub lead_score: f64,
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
@@ -146,9 +145,89 @@ pub struct ListSessionsResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
-    #[schema(value_type = Object)]
-    pub companion_insights: Option<serde_json::Value>,
-    pub agent_training_level: f64,
+    pub city: Option<String>,
+    pub location: Option<String>,
+    pub hometown: Option<String>,
+    pub nationality: Option<String>,
+    pub occupation: Option<String>,
+    pub mbti_guess: Option<String>,
+    pub love_values: Option<String>,
+    pub emotional_needs: Option<String>,
+    pub life_rhythm: Option<String>,
+    pub interests: Vec<String>,
+    pub personality_traits: Vec<String>,
+    pub preferred_gender: Option<String>,
+    pub age_min: Option<i32>,
+    pub age_max: Option<i32>,
+    pub deal_breakers: Vec<String>,
+    pub education: Option<String>,
+    pub family: Option<String>,
+    pub relationship_history: Option<String>,
+    pub social_pattern: Option<String>,
+    pub future_plans: Option<String>,
+    pub finance_status: Option<String>,
+    /// None when the user has no insights row yet.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl ProfileResponse {
+    fn from_row(
+        user_id: Uuid,
+        row: Option<eros_engine_store::human_insight::HumanInsightsRow>,
+    ) -> Self {
+        match row {
+            Some(r) => Self {
+                user_id,
+                city: r.city,
+                location: r.location,
+                hometown: r.hometown,
+                nationality: r.nationality,
+                occupation: r.occupation,
+                mbti_guess: r.mbti_guess,
+                love_values: r.love_values,
+                emotional_needs: r.emotional_needs,
+                life_rhythm: r.life_rhythm,
+                interests: r.interests,
+                personality_traits: r.personality_traits,
+                preferred_gender: r.preferred_gender,
+                age_min: r.age_min,
+                age_max: r.age_max,
+                deal_breakers: r.deal_breakers,
+                education: r.education,
+                family: r.family,
+                relationship_history: r.relationship_history,
+                social_pattern: r.social_pattern,
+                future_plans: r.future_plans,
+                finance_status: r.finance_status,
+                updated_at: Some(r.updated_at),
+            },
+            None => Self {
+                user_id,
+                city: None,
+                location: None,
+                hometown: None,
+                nationality: None,
+                occupation: None,
+                mbti_guess: None,
+                love_values: None,
+                emotional_needs: None,
+                life_rhythm: None,
+                interests: vec![],
+                personality_traits: vec![],
+                preferred_gender: None,
+                age_min: None,
+                age_max: None,
+                deal_breakers: vec![],
+                education: None,
+                family: None,
+                relationship_history: None,
+                social_pattern: None,
+                future_plans: None,
+                finance_status: None,
+                updated_at: None,
+            },
+        }
+    }
 }
 
 /// Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`
@@ -628,7 +707,6 @@ async fn list_sessions(
         .map(|s| SessionListEntry {
             session_id: s.id,
             instance_id: s.instance_id,
-            lead_score: s.lead_score,
             is_converted: s.is_converted,
             last_active_at: s.last_active_at,
             channel: s.channel,
@@ -640,8 +718,8 @@ async fn list_sessions(
     }))
 }
 
-/// Companion insights + computed training level for the JWT user. The
-/// path `user_id` MUST match the JWT's user_id; mismatch returns 403.
+/// Typed human_insights profile for the JWT user. The path `user_id` MUST
+/// match the JWT's user_id; mismatch returns 403.
 #[utoipa::path(
     get,
     path = "/comp/user/{user_id}/profile",
@@ -662,22 +740,9 @@ async fn get_profile(
     if user_id != jwt_user {
         return Err(AppError::Forbidden("not your data".into()));
     }
-
-    let repo = InsightRepo { pool: &state.pool };
+    let repo = HumanInsightRepo { pool: &state.pool };
     let row = repo.load(user_id).await?;
-    let (insights, training_level) = match row {
-        Some(r) => {
-            let lvl = compute_training_level(&r.insights);
-            (Some(r.insights), lvl)
-        }
-        None => (None, 0.0),
-    };
-
-    Ok(Json(ProfileResponse {
-        user_id,
-        companion_insights: insights,
-        agent_training_level: training_level,
-    }))
+    Ok(Json(ProfileResponse::from_row(user_id, row)))
 }
 
 // ─── Router ─────────────────────────────────────────────────────────
@@ -1649,5 +1714,101 @@ mod tests {
             .await
             .expect_err("archived instance must 404");
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    // ─── Test 5: ProfileResponse::from_row pins the column mapping ──
+    //
+    // Pure unit test (no DB): every Option<String> field gets a distinct
+    // value (its own field name), so any accidental transposition between
+    // `HumanInsightsRow` and `ProfileResponse` fails an assertion here.
+
+    #[test]
+    fn profile_response_from_row_maps_fields_by_name() {
+        use eros_engine_store::human_insight::HumanInsightsRow;
+
+        let user_id = Uuid::new_v4();
+        let updated_at = Utc::now();
+        let row = HumanInsightsRow {
+            user_id,
+            city: Some("city".into()),
+            location: Some("location".into()),
+            hometown: Some("hometown".into()),
+            nationality: Some("nationality".into()),
+            occupation: Some("occupation".into()),
+            mbti_guess: Some("mbti_guess".into()),
+            love_values: Some("love_values".into()),
+            emotional_needs: Some("emotional_needs".into()),
+            life_rhythm: Some("life_rhythm".into()),
+            interests: vec!["interests_0".into(), "interests_1".into()],
+            personality_traits: vec!["personality_traits_0".into()],
+            preferred_gender: Some("preferred_gender".into()),
+            age_min: Some(21),
+            age_max: Some(35),
+            deal_breakers: vec!["deal_breakers_0".into(), "deal_breakers_1".into()],
+            education: Some("education".into()),
+            family: Some("family".into()),
+            relationship_history: Some("relationship_history".into()),
+            social_pattern: Some("social_pattern".into()),
+            future_plans: Some("future_plans".into()),
+            finance_status: Some("finance_status".into()),
+            updated_at,
+        };
+
+        let resp = ProfileResponse::from_row(user_id, Some(row.clone()));
+        assert_eq!(resp.user_id, user_id);
+        assert_eq!(resp.city.as_deref(), Some("city"));
+        assert_eq!(resp.location.as_deref(), Some("location"));
+        assert_eq!(resp.hometown.as_deref(), Some("hometown"));
+        assert_eq!(resp.nationality.as_deref(), Some("nationality"));
+        assert_eq!(resp.occupation.as_deref(), Some("occupation"));
+        assert_eq!(resp.mbti_guess.as_deref(), Some("mbti_guess"));
+        assert_eq!(resp.love_values.as_deref(), Some("love_values"));
+        assert_eq!(resp.emotional_needs.as_deref(), Some("emotional_needs"));
+        assert_eq!(resp.life_rhythm.as_deref(), Some("life_rhythm"));
+        assert_eq!(resp.interests, vec!["interests_0", "interests_1"]);
+        assert_eq!(resp.personality_traits, vec!["personality_traits_0"]);
+        assert_eq!(resp.preferred_gender.as_deref(), Some("preferred_gender"));
+        assert_eq!(resp.age_min, Some(21));
+        assert_eq!(resp.age_max, Some(35));
+        assert_eq!(
+            resp.deal_breakers,
+            vec!["deal_breakers_0", "deal_breakers_1"]
+        );
+        assert_eq!(resp.education.as_deref(), Some("education"));
+        assert_eq!(resp.family.as_deref(), Some("family"));
+        assert_eq!(
+            resp.relationship_history.as_deref(),
+            Some("relationship_history")
+        );
+        assert_eq!(resp.social_pattern.as_deref(), Some("social_pattern"));
+        assert_eq!(resp.future_plans.as_deref(), Some("future_plans"));
+        assert_eq!(resp.finance_status.as_deref(), Some("finance_status"));
+        assert_eq!(resp.updated_at, Some(row.updated_at));
+
+        // None row: every field falls back to its empty/None default.
+        let empty = ProfileResponse::from_row(user_id, None);
+        assert_eq!(empty.user_id, user_id);
+        assert_eq!(empty.city, None);
+        assert_eq!(empty.location, None);
+        assert_eq!(empty.hometown, None);
+        assert_eq!(empty.nationality, None);
+        assert_eq!(empty.occupation, None);
+        assert_eq!(empty.mbti_guess, None);
+        assert_eq!(empty.love_values, None);
+        assert_eq!(empty.emotional_needs, None);
+        assert_eq!(empty.life_rhythm, None);
+        assert_eq!(empty.interests, Vec::<String>::new());
+        assert_eq!(empty.personality_traits, Vec::<String>::new());
+        assert_eq!(empty.preferred_gender, None);
+        assert_eq!(empty.age_min, None);
+        assert_eq!(empty.age_max, None);
+        assert_eq!(empty.deal_breakers, Vec::<String>::new());
+        assert_eq!(empty.education, None);
+        assert_eq!(empty.family, None);
+        assert_eq!(empty.relationship_history, None);
+        assert_eq!(empty.social_pattern, None);
+        assert_eq!(empty.future_plans, None);
+        assert_eq!(empty.finance_status, None);
+        assert_eq!(empty.updated_at, None);
     }
 }

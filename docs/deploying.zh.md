@@ -16,14 +16,13 @@
 
 ## 子命令
 
-二進制文件有五種模式（按 `argv[1]` 分派）：
+二進制文件有四種模式（按 `argv[1]` 分派）：
 
 | 子命令 | 用途 |
 |---|---|
 | `serve`（默認） | 在 `BIND_ADDR` 上跑 HTTP 服務器 |
 | `migrate` | 應用待處理的 sqlx migrations 然後退出 |
 | `seed-personas [dir]` | 读 `[dir]` 里每个 `*.toml` 文件（默认 `/etc/eros-engine/personas`——Docker 镜像里烧的示例），upsert 为人格基因 |
-| `backfill-human-insights` | 一次性把每行 `companion_insights` 投影进 `engine.human_insights`（幂等；仅手动执行） |
 | `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
@@ -268,5 +267,5 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 ## 源碼
 
 - `docker/Dockerfile`——多阶段构建（Rust 1.88 构建器 → debian:bookworm-slim 运行时）；`ghcr.io/etherfunlab/eros-engine` 就是用它构建的同一份产物
-- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那五种模式）
+- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那四种模式）
 - [`.env.example`](../.env.example)——运维环境变量清单（细节见本指南）
