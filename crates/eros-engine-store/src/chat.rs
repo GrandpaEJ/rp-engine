@@ -991,6 +991,42 @@ impl<'a> ChatRepo<'a> {
     /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
     /// continues_from — voice replies are single, whole messages. Bumps
     /// `last_active_at` in the same transaction as the insert.
+    ///
+    /// Idempotent on `user_message_id` (migration 0041): a second writer for the
+    /// same turn hits `ON CONFLICT`, whose behaviour depends on whether the
+    /// EXISTING row already carries the interrupt marker
+    /// (`metadata ? 'voice_interrupt'`):
+    /// - **marked** (an interrupt inserted or touched this row first): `content`
+    ///   and `truncated` are left as they are — the interrupt's report is
+    ///   authoritative — while `model`/`usage`/`generation_id` still refill from
+    ///   the conflicting write, so a still-live generator's billing audit is
+    ///   not lost. This is what lets the interrupt endpoint and a still-live
+    ///   generator race safely — content belongs to the interrupt, billing
+    ///   audit to the generator.
+    /// - **unmarked** (both writers are ordinary generators — e.g. an orphaned
+    ///   generator from a dead connection racing a client's retry of the same
+    ///   turn): last-writer-wins on EVERY column, `content` and `truncated`
+    ///   included. This keeps `content` and `generation_id` consistent with
+    ///   each other — the previous unconditional "refill audit columns only"
+    ///   rule could leave one generation's `content` paired with a DIFFERENT
+    ///   generation's `generation_id`, which OpenRouter reconciliation would
+    ///   silently mis-attribute.
+    ///
+    /// `usage` additionally falls back to the existing row's value when the
+    /// conflicting write's own `usage` is NULL (e.g. upstream never sent a
+    /// usage payload), so a race never downgrades known usage to unknown.
+    ///
+    /// The insert is additionally **skipped entirely** when the user row is
+    /// already marked `voice_interrupt` and no assistant reply exists yet —
+    /// that combination means the client reported nothing was heard, and the
+    /// "absent + empty" contract cell requires no assistant row at all. Without
+    /// this guard a still-live generator could win a race against an
+    /// empty-text interrupt and leave a full, untruncated reply with no
+    /// interrupt marker: indistinguishable from a normal completion. The first
+    /// statement below takes `FOR UPDATE` on the user row — the SAME row
+    /// `upsert_voice_interrupt` locks first — so the two writers cannot
+    /// interleave their check and their write; whichever commits first is the
+    /// one the other observes. This lock is load-bearing, not incidental.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_voice_assistant_message(
         &self,
@@ -1005,11 +1041,34 @@ impl<'a> ChatRepo<'a> {
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        // Same row `upsert_voice_interrupt` locks first (via its user-row
+        // UPDATE) — serializes the two writers so the marker check below can't
+        // race a concurrent empty-text interrupt.
+        sqlx::query("SELECT 1 FROM engine.chat_messages WHERE id = $1 FOR UPDATE")
+            .bind(user_message_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "INSERT INTO engine.chat_messages \
+            "INSERT INTO engine.chat_messages AS m \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
               generation_id, assistant_action_type, channel, metadata) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9)",
+             SELECT $1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9 \
+             WHERE NOT ( \
+                 COALESCE((SELECT u.metadata->>'voice_interrupt' \
+                             FROM engine.chat_messages u WHERE u.id = $4), 'false')::bool \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM engine.chat_messages a \
+                      WHERE a.user_message_id = $4 AND a.role = 'assistant' AND a.channel = 'voice' \
+                 ) \
+             ) \
+             ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
+             DO UPDATE SET content   = CASE WHEN m.metadata ? 'voice_interrupt' \
+                                             THEN m.content ELSE EXCLUDED.content END, \
+                           truncated = CASE WHEN m.metadata ? 'voice_interrupt' \
+                                             THEN m.truncated ELSE EXCLUDED.truncated END, \
+                           model = EXCLUDED.model, \
+                           usage = COALESCE(EXCLUDED.usage, m.usage), \
+                           generation_id = EXCLUDED.generation_id",
         )
         .bind(id)
         .bind(session_id)
@@ -1117,6 +1176,204 @@ impl<'a> ChatRepo<'a> {
         .execute(self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+}
+
+/// What the repair gate needs to know about one voice turn, in a single query.
+#[derive(Debug, Clone)]
+pub struct VoiceTurnRepair {
+    /// An assistant reply already exists — retrying would double-bill.
+    pub has_reply: bool,
+    /// The turn was deliberately interrupted — there is nothing to repair.
+    pub interrupted: bool,
+    /// The PERSISTED utterance. The repair path regenerates from this, never
+    /// from the retry body, so the turn's vector recall cannot drift between
+    /// attempts.
+    pub content: String,
+}
+
+/// Outcome of resolving a `client_msg_id` for the interrupt endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestTurnLookup {
+    /// No user row with this `client_msg_id` in this session.
+    NotFound,
+    /// Found, but a newer user turn exists — you can only barge in on what is
+    /// currently being spoken.
+    Stale,
+    Latest(Uuid),
+}
+
+impl<'a> ChatRepo<'a> {
+    /// Read the two facts the `turn/stream` duplicate gate needs, plus the
+    /// persisted utterance, in one round trip. Scoped to `role = 'user' AND
+    /// channel = 'voice'` — `insert_voice_user_message`'s conflict lookup
+    /// that supplies `user_message_id` is deliberately role-agnostic (the
+    /// colliding row can be a `gift_user` tip row, or even a text-channel
+    /// `user` row reached via `message/stream` against the same session id,
+    /// since that route has no channel guard). Returns `None` when the row
+    /// is not an actual voice user turn, so the caller can fall back to the
+    /// ordinary unconditional 409 instead of treating a tip or text row as a
+    /// repairable voice turn — regenerating against it would embed the
+    /// wrong text as the recall query and write a `channel='voice'`
+    /// assistant row pointing at a non-voice user row.
+    pub async fn voice_turn_repair_state(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<Option<VoiceTurnRepair>, sqlx::Error> {
+        let row: Option<(String, bool, bool)> = sqlx::query_as(
+            "SELECT u.content, \
+                    COALESCE(u.metadata->>'voice_interrupt', 'false')::bool, \
+                    EXISTS ( \
+                        SELECT 1 FROM engine.chat_messages a \
+                         WHERE a.user_message_id = u.id \
+                           AND a.role = 'assistant' AND a.channel = 'voice' \
+                    ) \
+               FROM engine.chat_messages u \
+              WHERE u.id = $1 AND u.role = 'user' AND u.channel = 'voice'",
+        )
+        .bind(user_message_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(
+            row.map(|(content, interrupted, has_reply)| VoiceTurnRepair {
+                has_reply,
+                interrupted,
+                content,
+            }),
+        )
+    }
+
+    /// Resolve a `client_msg_id` to its **voice** user row and report whether it
+    /// is the session's most recent voice user turn. Separating `NotFound` from
+    /// `Stale` lets the route return 404 vs. 409 without a second round trip.
+    ///
+    /// Both the target row and the "latest" subquery filter `channel = 'voice'`,
+    /// and that is load-bearing on both sides. A voice session can contain
+    /// non-voice user rows — `routes/companion_stream.rs` has no session-channel
+    /// gate, so a text turn can land in one — and without the filter on `m` such
+    /// a row is interruptible, letting a caller mark it and hang a
+    /// `channel='voice'` assistant reply off a text turn. Without the filter on
+    /// `l`, a newer text row would make a genuine voice turn look `Stale` and
+    /// block a legitimate barge-in. The comparison belongs entirely within the
+    /// voice channel.
+    pub async fn resolve_latest_voice_user_turn(
+        &self,
+        session_id: Uuid,
+        client_msg_id: &str,
+    ) -> Result<LatestTurnLookup, sqlx::Error> {
+        let row: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT m.id, \
+                    m.id = ( \
+                        SELECT l.id FROM engine.chat_messages l \
+                         WHERE l.session_id = $1 AND l.role = 'user' \
+                           AND l.channel = 'voice' \
+                         ORDER BY l.sent_at DESC, l.id DESC LIMIT 1 \
+                    ) \
+               FROM engine.chat_messages m \
+              WHERE m.session_id = $1 AND m.client_msg_id = $2 AND m.role = 'user' \
+                AND m.channel = 'voice'",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(match row {
+            None => LatestTurnLookup::NotFound,
+            Some((_, false)) => LatestTurnLookup::Stale,
+            Some((id, true)) => LatestTurnLookup::Latest(id),
+        })
+    }
+
+    /// Record a deliberate barge-in: mark the user row, and make the assistant
+    /// reply say what TTS actually played.
+    ///
+    /// `spoken_text` empty ⇒ NO assistant content is ever written (neither
+    /// inserted nor overwritten); the user-row marker alone records the
+    /// interrupt. That keeps the "never persist empty assistant content"
+    /// invariant `run_voice_turn` holds.
+    ///
+    /// Two different mechanisms protect the two branches against a still-live
+    /// generator, because a plain "check then write" is unsafe in general:
+    /// - **non-empty `spoken_text`**: the insert carries its own `ON CONFLICT`
+    ///   (rather than branching on a prior `SELECT`), so a concurrent
+    ///   `insert_voice_assistant_message` cannot slip between the check and
+    ///   the write — whichever arrives second just refills its own half
+    ///   (content here, audit columns there).
+    /// - **empty `spoken_text`**: there is no row to `ON CONFLICT` against
+    ///   when none exists yet, so the race is closed differently — this
+    ///   function's first statement (the marker `UPDATE ... WHERE id =
+    ///   user_message_id`) takes a row lock on the user row, and
+    ///   `insert_voice_assistant_message` takes the SAME lock as ITS first
+    ///   statement before checking the marker. The two transactions therefore
+    ///   serialize on that lock: whichever commits first is what the other
+    ///   observes, so the generator's marker check can never read a stale
+    ///   "not yet interrupted" state.
+    pub async fn upsert_voice_interrupt(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        candidate_assistant_id: Uuid,
+        spoken_text: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        const MARKER: &str = r#"{"voice_interrupt": true}"#;
+        let mut tx = self.pool.begin().await?;
+
+        // This UPDATE is also the lock acquisition: it takes a row lock on
+        // the user row that `insert_voice_assistant_message` takes too
+        // (there, via an explicit `FOR UPDATE`) before consulting this same
+        // marker. That serializes the two writers on the empty-text branch,
+        // where there is no row to `ON CONFLICT` against yet. Load-bearing,
+        // not incidental — do not reorder this below the branch that follows.
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
+              WHERE id = $1",
+        )
+        .bind(user_message_id)
+        .bind(MARKER)
+        .execute(&mut *tx)
+        .await?;
+
+        let assistant_id: Option<Uuid> = if spoken_text.is_empty() {
+            sqlx::query_scalar(
+                "UPDATE engine.chat_messages \
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
+                  WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice' \
+                  RETURNING id",
+            )
+            .bind(user_message_id)
+            .bind(MARKER)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            Some(
+                sqlx::query_scalar(
+                    "INSERT INTO engine.chat_messages AS m \
+                     (id, session_id, role, content, user_message_id, truncated, \
+                      assistant_action_type, channel, metadata) \
+                     VALUES ($1, $2, 'assistant', $3, $4, true, 'reply', 'voice', $5::jsonb) \
+                     ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
+                     DO UPDATE SET content = EXCLUDED.content, \
+                                   truncated = true, \
+                                   metadata = COALESCE(m.metadata, '{}'::jsonb) || EXCLUDED.metadata \
+                     RETURNING m.id",
+                )
+                .bind(candidate_assistant_id)
+                .bind(session_id)
+                .bind(spoken_text)
+                .bind(user_message_id)
+                .bind(MARKER)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        };
+
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(assistant_id)
     }
 }
 
@@ -3194,6 +3451,329 @@ mod tests {
         );
     }
 
+    /// Seeds a fresh voice session plus its one user turn via the real store
+    /// methods (`throwaway_session` + `insert_voice_user_message`) rather than
+    /// duplicating their genome/instance/session SQL inline.
+    async fn seed_voice_turn(pool: &PgPool, content: &str) -> (Uuid, Uuid) {
+        let session_id = throwaway_session(pool).await.id;
+        let repo = ChatRepo { pool };
+        let user_mid = match repo
+            .insert_voice_user_message(session_id, content, &format!("cmid-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        (session_id, user_mid)
+    }
+
+    /// Generator-vs-generator race, no interrupt marker involved: e.g. an
+    /// orphaned generator from a dead connection is still alive (TCP
+    /// retransmission keeps it going for tens of seconds) when the client's
+    /// retry lands its OWN generator for the same turn. Migration 0041 keeps
+    /// this to one row, but the surviving row must be entirely the SAME
+    /// call's data — `content`, `truncated`, AND the audit columns —  never a
+    /// mix of one generation's `content` with a DIFFERENT generation's
+    /// `generation_id` (which would corrupt OpenRouter reconciliation).
+    #[sqlx::test(migrations = "./migrations")]
+    #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
+    async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        // Generator A writes first — no interrupt marker on the user row.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "first",
+            Some("m/0"),
+            None,
+            Some("gen-0"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Generator B conflicts on the same row with DIFFERENT content AND a
+        // DIFFERENT generation_id. Must NOT create a second row; must be
+        // last-writer-wins on every column (content included), so the
+        // surviving row never pairs A's content with B's generation_id.
+        let usage = serde_json::json!({"total_tokens": 7});
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "second",
+            Some("m/1"),
+            Some(&usage),
+            Some("gen-1"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT content, model, generation_id, truncated, usage FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice'",
+        )
+        .bind(user_mid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one assistant reply per voice user turn"
+        );
+        assert_eq!(
+            rows[0].0, "second",
+            "no interrupt marker ⇒ last-writer-wins on content, not first-writer-wins"
+        );
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("m/1"),
+            "audit columns come from the SAME (surviving) writer as content"
+        );
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some("gen-1"),
+            "generation_id must match the surviving content's call, never a stale earlier generation"
+        );
+        assert!(
+            !rows[0].3,
+            "truncated must come from the same writer as content"
+        );
+        assert_eq!(
+            rows[0].4,
+            Some(serde_json::json!({"total_tokens": 7})),
+            "usage must come from the same writer as content"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_reports_reply_marker_and_content(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello there").await;
+
+        // Fresh turn: nothing yet.
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("seed_voice_turn produces an actual voice user turn");
+        assert!(!st.has_reply);
+        assert!(!st.interrupted);
+        assert_eq!(
+            st.content, "hello there",
+            "the persisted utterance comes back"
+        );
+
+        // A reply flips has_reply.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "hi",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("still an actual voice user turn");
+        assert!(st.has_reply);
+        assert!(!st.interrupted);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_reports_interrupt_marker(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (_session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata,'{}'::jsonb) || '{\"voice_interrupt\": true}'::jsonb \
+             WHERE id = $1",
+        )
+        .bind(user_mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("still an actual voice user turn");
+        assert!(
+            st.interrupted,
+            "the marker must be visible to the repair gate"
+        );
+        assert!(!st.has_reply);
+    }
+
+    /// `insert_voice_user_message`'s conflict lookup that supplies
+    /// `user_message_id` is deliberately role-agnostic (the colliding row can
+    /// be a `gift_user` tip row, or a text-channel `user` row reached via
+    /// `message/stream` against the same session id, since that route has no
+    /// channel guard). The repair gate must independently refuse to treat
+    /// either as a repairable voice turn.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_is_none_for_non_voice_user_rows(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id = throwaway_session(&pool).await.id;
+
+        let gift_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, 'gift_user', '(打赏 $20)', 'cid-gift', '{\"tips_amount_usd\": 20.0}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.voice_turn_repair_state(gift_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a gift_user row must never be reported as a repairable voice turn"
+        );
+
+        let text_user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'user', 'hi', 'cid-text') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.voice_turn_repair_state(text_user_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a channel-less (text) user row must never be reported as a repairable voice turn"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_turn_lookup_classifies_missing_stale_and_latest(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, _first) = seed_voice_turn(&pool, "one").await;
+
+        // Give the first turn a client_msg_id, then add a newer one.
+        sqlx::query(
+            "UPDATE engine.chat_messages SET client_msg_id = 'CID-ONE' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.resolve_latest_voice_user_turn(session_id, "NOPE")
+                .await
+                .unwrap(),
+            LatestTurnLookup::NotFound
+        ));
+        assert!(matches!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-ONE")
+                .await
+                .unwrap(),
+            LatestTurnLookup::Latest(_)
+        ));
+
+        let second: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, client_msg_id) \
+             VALUES ($1,'user','two','voice','CID-TWO') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                repo.resolve_latest_voice_user_turn(session_id, "CID-ONE")
+                    .await
+                    .unwrap(),
+                LatestTurnLookup::Stale
+            ),
+            "an older turn must not be interruptible"
+        );
+        assert_eq!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-TWO")
+                .await
+                .unwrap(),
+            LatestTurnLookup::Latest(second)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_turn_lookup_ignores_non_voice_rows_on_both_sides(pool: PgPool) {
+        // A voice session can hold non-voice user rows: `routes/companion_stream.rs`
+        // has no session-channel gate, so a text turn can land in one. Both sides
+        // of the lookup must stay inside the voice channel.
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, _voice) = seed_voice_turn(&pool, "spoken").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages SET client_msg_id = 'CID-VOICE' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A NEWER text-channel user row lands in the same session.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1,'user','typed','CID-TEXT')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The text row must not be interruptible — otherwise a caller could mark
+        // it and hang a channel='voice' assistant reply off a text turn.
+        assert_eq!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-TEXT")
+                .await
+                .unwrap(),
+            LatestTurnLookup::NotFound,
+            "a text-channel row must never resolve as an interruptible voice turn"
+        );
+
+        // And it must not shadow the genuine voice turn into Stale, which would
+        // block a legitimate barge-in.
+        assert!(
+            matches!(
+                repo.resolve_latest_voice_user_turn(session_id, "CID-VOICE")
+                    .await
+                    .unwrap(),
+                LatestTurnLookup::Latest(_)
+            ),
+            "a newer text row must not make the latest voice turn look stale"
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn channel_check_accepts_product_qa_and_rejects_unknown(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
@@ -3615,5 +4195,272 @@ mod tests {
             "pre-existing metadata keys must survive the merge"
         );
         assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_inserts_spoken_text_and_marks_user_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let aid = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "你今天过得")
+            .await
+            .unwrap()
+            .expect("a row is written when text was played");
+
+        let (content, truncated): (String, bool) =
+            sqlx::query_as("SELECT content, truncated FROM engine.chat_messages WHERE id = $1")
+                .bind(aid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "你今天过得");
+        assert!(truncated);
+
+        let marked: bool = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->>'voice_interrupt','false')::bool \
+               FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked, "the user row carries the marker");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_with_empty_text_marks_but_writes_no_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let out = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "empty spoken_text must never write assistant content"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+
+        let marked: bool = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->>'voice_interrupt','false')::bool \
+               FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked, "still distinguishable from a disconnect");
+    }
+
+    /// The race the empty-text branch cannot close with `ON CONFLICT` alone:
+    /// the client hears nothing and interrupts BEFORE the generator commits.
+    /// `insert_voice_assistant_message` must see the marker (via the shared
+    /// user-row lock) and decline to insert — the "absent + empty" contract
+    /// cell requires no assistant row at all, not a full untruncated reply
+    /// masquerading as a normal completion.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn empty_interrupt_then_generator_leaves_no_assistant_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let out = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+        assert!(out.is_none());
+
+        // The generator was still alive and only now reaches its own insert.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-late"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "the generator must decline to insert once the turn is marked interrupted with nothing played"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_after_completion_overwrites_content_keeps_audit(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        let usage = serde_json::json!({"total_tokens": 42});
+        let scope = serde_json::json!({"relationship_scope": "both"});
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "the whole sentence",
+            Some("m/1"),
+            Some(&usage),
+            Some("gen-9"),
+            false,
+            Some(&scope),
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "the whole")
+            .await
+            .unwrap()
+            .expect("returns the existing row's id");
+
+        let (content, model, gen, truncated, meta): (
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT content, model, generation_id, truncated, metadata \
+               FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "the whole", "content is what was actually heard");
+        assert_eq!(model.as_deref(), Some("m/1"), "billing audit survives");
+        assert_eq!(gen.as_deref(), Some("gen-9"));
+        assert!(truncated);
+        assert_eq!(
+            meta["relationship_scope"], "both",
+            "generator metadata preserved"
+        );
+        assert_eq!(
+            meta["voice_interrupt"], true,
+            "marker merged in, not replacing"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_with_empty_text_leaves_completed_reply_alone(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "already said this",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            content, "already said this",
+            "degenerate case is non-destructive"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn double_write_race_is_order_independent(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+
+        // Order A: interrupt first, generator second.
+        let (s1, u1) = seed_voice_turn(&pool, "hello").await;
+        repo.upsert_voice_interrupt(s1, u1, Uuid::new_v4(), "heard this much")
+            .await
+            .unwrap();
+        repo.insert_voice_assistant_message(
+            s1,
+            u1,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-a"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Order B: generator first, interrupt second.
+        let (s2, u2) = seed_voice_turn(&pool, "hello").await;
+        repo.insert_voice_assistant_message(
+            s2,
+            u2,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-b"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.upsert_voice_interrupt(s2, u2, Uuid::new_v4(), "heard this much")
+            .await
+            .unwrap();
+
+        for (uid, gen) in [(u1, "gen-a"), (u2, "gen-b")] {
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT content, generation_id FROM engine.chat_messages \
+                  WHERE user_message_id = $1 AND role = 'assistant'",
+            )
+            .bind(uid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "one row regardless of arrival order");
+            assert_eq!(
+                rows[0].0, "heard this much",
+                "content is always the interrupt's"
+            );
+            assert_eq!(
+                rows[0].1.as_deref(),
+                Some(gen),
+                "audit is always the generator's"
+            );
+        }
     }
 }
