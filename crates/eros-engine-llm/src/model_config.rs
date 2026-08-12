@@ -802,16 +802,27 @@ pub struct TaskConfig {
     pub model_write: Option<String>,
     #[serde(default)]
     pub temperature: Option<f64>,
-    /// Nucleus-sampling probability mass. Chat task only; task-level (tiers
-    /// inherit, like `temperature`); no `[defaults]` fallback. `None` ⇒ omit.
+    /// Nucleus-sampling probability mass. Valid on every task except
+    /// `embedding`; task-level (tiers inherit, like `temperature`); no
+    /// `[defaults]` fallback. `None` ⇒ omit. Legal range `(0.0, 1.0]`,
+    /// enforced by `validate_sampling`.
     #[serde(default)]
     pub top_p: Option<f32>,
     /// OpenAI-style frequency penalty. Same scoping rules as `top_p`.
+    /// Legal range `[-2.0, 2.0]`.
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     /// OpenAI-style presence penalty. Same scoping rules as `top_p`.
+    /// Legal range `[-2.0, 2.0]`.
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Repetition penalty — the knob aimed at degenerate tail repetition,
+    /// which `temperature` cannot address (issue #246): looping is
+    /// characteristic of near-greedy decoding, so lowering temperature pushes
+    /// the wrong way. Same scoping rules as `top_p`. Legal range `(0.0, 2.0]`;
+    /// `1.0` is the no-op identity.
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -978,6 +989,30 @@ pub struct ResolvedEmbedding {
 
 const DEFAULT_EMBED_MODEL: &str = "voyage-4-lite";
 
+/// The optional sampling knobs a task may set, grouped so every resolver and
+/// call site carries them as one value.
+///
+/// Grouped deliberately: issue #246 was caused by three loose fields that
+/// twelve `Resolved*` structs each had to remember to copy, and none did. One
+/// field is hard to forget; three are easy. The wire shape is NOT nested —
+/// `WireRequest` keeps flat siblings and is populated from here, so adding a
+/// fifth knob touches this struct, `TaskConfig`, and `WireRequest`, and
+/// nothing else.
+///
+/// All four are standard OpenAI chat/completions parameters accepted by every
+/// OpenAI-compatible endpoint, so none is subject to the strict-subset strip
+/// that `WireRequest::for_endpoint` applies to custom `[providers]` endpoints.
+///
+/// `None` on any field ⇒ that wire param is omitted entirely, never sent with
+/// an engine-chosen default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sampling {
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+}
+
 /// Resolved model parameters for an LLM call.
 ///
 /// `fallback_model` is intentionally singular-named even though it's a
@@ -989,11 +1024,9 @@ pub struct ResolvedModel {
     pub model: String,
     pub fallback_model: Vec<String>,
     pub temperature: f64,
-    /// Optional sampling knobs resolved from the task block (chat task only).
-    /// `None` ⇒ the corresponding wire param is omitted.
-    pub top_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
+    /// Optional sampling knobs resolved from the task block. Task-level; every
+    /// non-embedding task may set them (issue #246).
+    pub sampling: Sampling,
     pub max_tokens: u32,
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
@@ -1028,6 +1061,8 @@ pub struct ResolvedOutputFilter {
     /// only (no per-tier override), consistent with `chat_companion`'s own
     /// `reasoning` field shape.
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Per-turn trigger for the user-input rewrite filter (`input_filter` on
@@ -1100,6 +1135,8 @@ pub struct ResolvedInputFilter {
     /// trigger resolves to `None`). The stream wiring draws one coin flip per
     /// turn and runs the filter LLM only when `draw < probability`.
     pub probability: f64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved image-describe task (`chat_vision`). Mirrors `ResolvedInputFilter`
@@ -1114,6 +1151,8 @@ pub struct ResolvedVision {
     pub describe_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Built-in, product-identity-free voice directive. Deployments override it via
@@ -1146,6 +1185,8 @@ pub struct ResolvedVoice {
     pub reasoning: Option<ReasoningConfig>,
     pub directive: String,
     pub recall: bool,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Generic, product-identity-free default prompt for the image-prompt composer.
@@ -1190,6 +1231,8 @@ pub struct ResolvedImagePromptCompose {
     /// variant selection to speak of: `Plain`, no `filter_prompt`, or a miss
     /// (built-in prompt fallback).
     pub variant_key: Option<String>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
@@ -1206,6 +1249,8 @@ pub struct ResolvedPde {
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved product-QA executor task (`chat_product_qa`). Mirrors
@@ -1222,6 +1267,8 @@ pub struct ResolvedProductQa {
     pub answer_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
@@ -1238,6 +1285,8 @@ pub struct ResolvedExtract {
     pub extract_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-director task (`world_director`). The configured `filter_prompt`
@@ -1255,6 +1304,8 @@ pub struct ResolvedWorldDirector {
     pub structured_output: bool,
     pub interval_hours: u32,
     pub retention_days: u32,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-town comment-round task (`world_comment`). The configured
@@ -1271,6 +1322,8 @@ pub struct ResolvedWorldComment {
     pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     pub round_secs: u64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-town reply-responder task (`world_reply`). Plain-text
@@ -1288,6 +1341,8 @@ pub struct ResolvedWorldReply {
     pub thread_cooldown_secs: u64,
     pub daily_cap: u32,
     pub reply_window_secs: u64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-stories task (`world_stories_director`). The configured
@@ -1307,6 +1362,8 @@ pub struct ResolvedWorldStories {
     pub retention_days: u32,
     pub active_window_hours: u32,
     pub context_days: u32,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Where the model config comes from, resolved from the two env vars.
@@ -1552,9 +1609,12 @@ impl ModelConfig {
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
         // Task-level only (tiers inherit; no `[defaults]` fallback). None ⇒ omit.
-        let top_p = task_cfg.and_then(|t| t.top_p);
-        let frequency_penalty = task_cfg.and_then(|t| t.frequency_penalty);
-        let presence_penalty = task_cfg.and_then(|t| t.presence_penalty);
+        let sampling = Sampling {
+            top_p: task_cfg.and_then(|t| t.top_p),
+            frequency_penalty: task_cfg.and_then(|t| t.frequency_penalty),
+            presence_penalty: task_cfg.and_then(|t| t.presence_penalty),
+            repetition_penalty: task_cfg.and_then(|t| t.repetition_penalty),
+        };
 
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
         let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
@@ -1571,9 +1631,7 @@ impl ModelConfig {
             model,
             fallback_model,
             temperature,
-            top_p,
-            frequency_penalty,
-            presence_penalty,
+            sampling,
             max_tokens,
             allow_traits,
             reasoning,
@@ -1668,6 +1726,7 @@ impl ModelConfig {
             timing,
             retry_depth,
             reasoning,
+            sampling: m.sampling,
         })
     }
 
@@ -1715,6 +1774,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             probability,
+            sampling: m.sampling,
         })
     }
 
@@ -1742,6 +1802,7 @@ impl ModelConfig {
             describe_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            sampling: m.sampling,
         })
     }
 
@@ -1781,6 +1842,7 @@ impl ModelConfig {
             reasoning: m.reasoning,
             directive,
             recall,
+            sampling: m.sampling,
         })
     }
 
@@ -1827,6 +1889,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             structured_output: task_cfg.structured_output.unwrap_or(true),
+            sampling: m.sampling,
         })
     }
 
@@ -1854,6 +1917,7 @@ impl ModelConfig {
             answer_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            sampling: m.sampling,
         })
     }
 
@@ -1983,6 +2047,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             variant_key,
+            sampling: m.sampling,
         })
     }
 }
@@ -2131,6 +2196,7 @@ impl ModelConfig {
             extract_prompt,
             retry_depth: m.retry_depth,
             reasoning: m.reasoning,
+            sampling: m.sampling,
         })
     }
 
@@ -2157,6 +2223,7 @@ impl ModelConfig {
             // not a meaningful "run continuously" setting.
             interval_hours: task_cfg.interval_hours.unwrap_or(24).max(1),
             retention_days: task_cfg.retention_days.unwrap_or(30),
+            sampling: m.sampling,
         })
     }
 
@@ -2180,6 +2247,7 @@ impl ModelConfig {
             reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             round_secs: task_cfg.round_secs.unwrap_or(3600).max(60),
+            sampling: m.sampling,
         })
     }
 
@@ -2226,6 +2294,7 @@ impl ModelConfig {
             thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
             daily_cap: task_cfg.daily_cap.unwrap_or(20),
             reply_window_secs,
+            sampling: m.sampling,
         })
     }
 
@@ -2254,6 +2323,7 @@ impl ModelConfig {
             retention_days: task_cfg.retention_days.unwrap_or(30),
             active_window_hours: task_cfg.active_window_hours.unwrap_or(72).max(1),
             context_days: task_cfg.context_days.unwrap_or(7).max(1),
+            sampling: m.sampling,
         })
     }
 
@@ -2401,7 +2471,76 @@ impl ModelConfig {
         }
         Ok(())
     }
+
+    /// Boot gate for the four sampling knobs (issue #246).
+    ///
+    /// Two refusals, both aimed at the same failure mode — config that parses,
+    /// boots, and does nothing:
+    ///
+    /// 1. Out-of-range or non-finite values. Providers handle these
+    ///    inconsistently (some 400, some clamp, some ignore), so an operator
+    ///    who typo'd `top_p = 9` would otherwise never learn.
+    /// 2. Any of the four on `[tasks.embedding]`. Embeddings take no
+    ///    chat-shaped sampling parameters at all, so the key could never do
+    ///    anything — leaving it silent would reproduce the very bug #246 fixed
+    ///    everywhere else.
+    ///
+    /// Task names are visited in sorted order so the message an operator sees
+    /// is stable across restarts.
+    pub fn validate_sampling(&self) -> Result<(), String> {
+        // (field, low, high, low_inclusive) — `high` is always inclusive.
+        const RANGES: [(&str, f32, f32, bool); 4] = [
+            ("top_p", 0.0, 1.0, false),
+            ("frequency_penalty", -2.0, 2.0, true),
+            ("presence_penalty", -2.0, 2.0, true),
+            ("repetition_penalty", 0.0, 2.0, false),
+        ];
+
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            let t = &self.tasks[name];
+            let values = [
+                t.top_p,
+                t.frequency_penalty,
+                t.presence_penalty,
+                t.repetition_penalty,
+            ];
+
+            for ((field, low, high, low_inclusive), value) in RANGES.iter().zip(values) {
+                let Some(v) = value else { continue };
+
+                if name == EMBEDDING_TASK {
+                    return Err(format!(
+                        "[tasks].{EMBEDDING_TASK}.{field}: embedding takes no chat-shaped \
+                         sampling parameters — the key could never do anything, so eros-engine \
+                         refuses to boot rather than let it silently no-op. Delete it. \
+                         Rationale: https://github.com/etherfunlab/eros-engine/issues/246"
+                    ));
+                }
+
+                if !v.is_finite() {
+                    return Err(format!(
+                        "[tasks].{name}.{field}: must be a finite number, got {v}"
+                    ));
+                }
+
+                let low_ok = if *low_inclusive { v >= *low } else { v > *low };
+                if !low_ok || v > *high {
+                    let open = if *low_inclusive { '[' } else { '(' };
+                    return Err(format!(
+                        "[tasks].{name}.{field}: must be in {open}{low:.1}, {high:.1}], got {v}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+/// The one task that takes no chat-shaped sampling parameters — see
+/// [`ModelConfig::validate_sampling`].
+const EMBEDDING_TASK: &str = "embedding";
 
 /// Tasks whose config the engine ever resolves with a tier. Everything else
 /// resolves tier-free, so a `[tasks.<other>.tiers.*]` block is dead config —
@@ -3227,6 +3366,10 @@ max_tokens   = 600
 description  = "AI companion chat"
 allow_traits = ["allow_politics"]
 input_filter = true
+top_p              = 0.9
+frequency_penalty  = 0.4
+presence_penalty   = 0.2
+repetition_penalty = 1.15
 
 [tasks.chat_companion.tiers.gold]
 model        = "x-ai/grok-4.20"
@@ -3306,6 +3449,11 @@ filter_prompt = "Answer product questions from the docs."
         );
         assert_eq!(chat.temperature, Some(0.85));
         assert_eq!(chat.max_tokens, Some(600));
+        // Sampling knobs round-trip (schema lock, issue #246).
+        assert_eq!(chat.top_p, Some(0.9));
+        assert_eq!(chat.frequency_penalty, Some(0.4));
+        assert_eq!(chat.presence_penalty, Some(0.2));
+        assert_eq!(chat.repetition_penalty, Some(1.15));
         assert_eq!(chat.description, "AI companion chat");
         // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
         assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));
@@ -3666,14 +3814,14 @@ reasoning = { exclude = true }
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, Some(0.9));
-        assert_eq!(r.frequency_penalty, Some(0.4));
-        assert_eq!(r.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.top_p, Some(0.9));
+        assert_eq!(r.sampling.frequency_penalty, Some(0.4));
+        assert_eq!(r.sampling.presence_penalty, Some(0.2));
+        // The shipped example deliberately leaves repetition_penalty unset.
+        assert_eq!(r.sampling.repetition_penalty, None);
         // Extraction stays deterministic — no sampling knobs.
         let e = cfg.resolve("insight_extraction", None);
-        assert_eq!(e.top_p, None);
-        assert_eq!(e.frequency_penalty, None);
-        assert_eq!(e.presence_penalty, None);
+        assert_eq!(e.sampling, Sampling::default());
     }
 
     #[test]
@@ -5138,12 +5286,14 @@ temperature = 0.8
 top_p = 0.9
 frequency_penalty = 0.4
 presence_penalty = 0.2
+repetition_penalty = 1.15
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, Some(0.9));
-        assert_eq!(r.frequency_penalty, Some(0.4));
-        assert_eq!(r.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.top_p, Some(0.9));
+        assert_eq!(r.sampling.frequency_penalty, Some(0.4));
+        assert_eq!(r.sampling.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.repetition_penalty, Some(1.15));
     }
 
     #[test]
@@ -5155,9 +5305,241 @@ temperature = 0.8
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, None);
-        assert_eq!(r.frequency_penalty, None);
-        assert_eq!(r.presence_penalty, None);
+        assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn validate_sampling_accepts_in_range_and_absent() {
+        for toml in [
+            "[tasks.chat_companion]\nmodel = \"m\"\n",
+            "[tasks.chat_companion]\nmodel = \"m\"\ntop_p = 1.0\nfrequency_penalty = -2.0\npresence_penalty = 2.0\nrepetition_penalty = 2.0\n",
+            "[tasks.pde_decision]\nmodel = \"m\"\ntop_p = 0.0001\nrepetition_penalty = 0.0001\n",
+            // embedding without sampling knobs is untouched
+            "[tasks.embedding]\nmodel = \"voyage-4-lite\"\n",
+        ] {
+            ModelConfig::from_toml_str(toml)
+                .unwrap()
+                .validate_sampling()
+                .unwrap_or_else(|e| panic!("must accept:\n{toml}\ngot: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_out_of_range() {
+        for (field, value) in [
+            ("top_p", "1.5"),
+            ("top_p", "0.0"),
+            ("top_p", "-0.1"),
+            ("frequency_penalty", "2.1"),
+            ("frequency_penalty", "-2.1"),
+            ("presence_penalty", "3.0"),
+            ("presence_penalty", "-3.0"),
+            ("repetition_penalty", "0.0"),
+            ("repetition_penalty", "2.5"),
+        ] {
+            let toml = format!("[tasks.pde_decision]\nmodel = \"m\"\n{field} = {value}\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .expect_err(&format!("{field} = {value} must refuse"));
+            assert!(err.contains(field), "{field}={value}: {err}");
+            assert!(err.contains("pde_decision"), "{field}={value}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_non_finite() {
+        for value in ["nan", "inf", "-inf"] {
+            let toml = format!("[tasks.pde_decision]\nmodel = \"m\"\ntop_p = {value}\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .unwrap_err();
+            assert!(err.contains("top_p"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_knobs_on_embedding() {
+        for field in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            let toml = format!("[tasks.embedding]\nmodel = \"voyage-4-lite\"\n{field} = 0.5\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .expect_err(&format!("embedding.{field} must refuse"));
+            assert!(err.contains("embedding"), "{field}: {err}");
+            assert!(err.contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_non_embedding_resolver_carries_sampling() {
+        // Issue #246 regression lock: a resolver that forgets `sampling: m.sampling`
+        // makes its task's config silently no-op. One distinct knob value per
+        // resolver, so a copy-paste that reads the wrong task also fails.
+        let cfg = ModelConfig::from_toml_str(
+            r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = true
+input_filter = true
+top_p = 0.61
+
+[tasks.chat_output_filter]
+model = "m"
+filter_prompt = "rewrite"
+top_p = 0.62
+
+[tasks.chat_input_filter]
+model = "m"
+filter_prompt = "rewrite"
+top_p = 0.63
+
+[tasks.chat_voice]
+model = "m"
+top_p = 0.64
+
+[tasks.chat_image_prompt_compose]
+model = "m"
+top_p = 0.65
+
+[tasks.pde_decision]
+model = "m"
+filter_prompt = "judge"
+top_p = 0.66
+
+[tasks.chat_product_qa]
+model = "m"
+filter_prompt = "answer"
+top_p = 0.67
+
+[tasks.insight_extraction]
+model = "m"
+filter_prompt = "extract"
+top_p = 0.68
+
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "extract"
+top_p = 0.69
+
+[tasks.world_director]
+model = "m"
+filter_prompt = "direct"
+top_p = 0.70
+
+[tasks.world_comment]
+model = "m"
+filter_prompt = "comment"
+top_p = 0.71
+
+[tasks.world_reply]
+model = "m"
+filter_prompt = "reply"
+top_p = 0.72
+
+[tasks.world_stories_director]
+model = "m"
+filter_prompt = "stories"
+top_p = 0.73
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.resolve("chat_companion", None).sampling.top_p,
+            Some(0.61)
+        );
+        assert_eq!(
+            cfg.resolve_output_filter(None).unwrap().sampling.top_p,
+            Some(0.62)
+        );
+        assert_eq!(
+            cfg.resolve_input_filter().unwrap().sampling.top_p,
+            Some(0.63)
+        );
+        assert_eq!(cfg.resolve_voice().unwrap().sampling.top_p, Some(0.64));
+        assert_eq!(
+            cfg.resolve_image_prompt_compose(None)
+                .unwrap()
+                .sampling
+                .top_p,
+            Some(0.65)
+        );
+        assert_eq!(cfg.resolve_pde().unwrap().sampling.top_p, Some(0.66));
+        assert_eq!(cfg.resolve_product_qa().unwrap().sampling.top_p, Some(0.67));
+        assert_eq!(
+            cfg.resolve_insight_extract().unwrap().sampling.top_p,
+            Some(0.68)
+        );
+        assert_eq!(
+            cfg.resolve_memory_extract().unwrap().sampling.top_p,
+            Some(0.69)
+        );
+        assert_eq!(
+            cfg.resolve_world_director().unwrap().sampling.top_p,
+            Some(0.70)
+        );
+        assert_eq!(
+            cfg.resolve_world_comment().unwrap().sampling.top_p,
+            Some(0.71)
+        );
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().sampling.top_p,
+            Some(0.72)
+        );
+        assert_eq!(
+            cfg.resolve_world_stories_director().unwrap().sampling.top_p,
+            Some(0.73)
+        );
+    }
+
+    #[test]
+    fn resolve_vision_carries_sampling() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\nmodel = \"m\"\nfilter_prompt = \"describe\"\ntop_p = 0.7\nrepetition_penalty = 1.1\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_vision().expect("vision enabled");
+        assert_eq!(v.sampling.top_p, Some(0.7));
+        assert_eq!(v.sampling.repetition_penalty, Some(1.1));
+    }
+
+    #[test]
+    fn sampling_params_resolve_on_non_chat_tasks() {
+        // Issue #246: the four knobs are generic TaskConfig fields, so they
+        // must resolve for ANY task, not just chat_companion.
+        let toml = r#"
+[tasks.pde_decision]
+model = "m"
+top_p = 0.5
+repetition_penalty = 1.2
+
+[tasks.world_reply]
+model = "m"
+frequency_penalty = 0.3
+
+[tasks.chat_vision]
+model = "m"
+presence_penalty = -0.5
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let pde = cfg.resolve("pde_decision", None);
+        assert_eq!(pde.sampling.top_p, Some(0.5));
+        assert_eq!(pde.sampling.repetition_penalty, Some(1.2));
+        assert_eq!(
+            cfg.resolve("world_reply", None).sampling.frequency_penalty,
+            Some(0.3)
+        );
+        assert_eq!(
+            cfg.resolve("chat_vision", None).sampling.presence_penalty,
+            Some(-0.5)
+        );
     }
 
     #[test]
