@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "1.0.4"
+    "version": "1.1.0"
   },
   "servers": [
     {
@@ -603,7 +603,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "Companion insights + computed training level for the JWT user. The\npath `user_id` MUST match the JWT's user_id; mismatch returns 403.",
+        "summary": "Typed human_insights profile for the JWT user. The path `user_id` MUST\nmatch the JWT's user_id; mismatch returns 403.",
         "operationId": "get_profile",
         "parameters": [
           {
@@ -1945,16 +1945,146 @@
         "type": "object",
         "required": [
           "user_id",
-          "companion_insights",
-          "agent_training_level"
+          "interests",
+          "personality_traits",
+          "deal_breakers"
         ],
         "properties": {
-          "agent_training_level": {
-            "type": "number",
-            "format": "double"
+          "age_max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
           },
-          "companion_insights": {
-            "type": "object"
+          "age_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deal_breakers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "education": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "emotional_needs": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finance_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "future_plans": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hometown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "interests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "life_rhythm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "love_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mbti_guess": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nationality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personality_traits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preferred_gender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationship_history": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "social_pattern": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "None when the user has no insights row yet."
           },
           "user_id": {
             "type": "string",
@@ -1984,7 +2114,6 @@
         "type": "object",
         "required": [
           "session_id",
-          "lead_score",
           "is_converted",
           "last_active_at",
           "channel"
@@ -2007,10 +2136,6 @@
           "last_active_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "lead_score": {
-            "type": "number",
-            "format": "double"
           },
           "session_id": {
             "type": "string",
@@ -2260,6 +2385,17 @@
           "client_msg_id"
         ],
         "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto",
+                "description": "Which affinity halves feed this turn's relationship line — same field\nname, value space, and default (`bond`) as the chat message stream:\n`\"full\" | \"bond_and_chemistry\" | \"bond\" | \"chemistry\" | \"none\"`, or an\narray of axis names such as `[\"warmth\", \"trust\"]`. Axes flatten to the\ntwo injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒\nchemistry half). When both this and the deprecated `relationship_scope`\nare sent, this field wins."
+              }
+            ]
+          },
           "client_msg_id": {
             "type": "string"
           },
@@ -2278,7 +2414,7 @@
               "string",
               "null"
             ],
-            "description": "Which halves of the relationship line to inject this turn:\n`none | bond | chemistry | both`. Omitted ⇒ `both`."
+            "description": "**Deprecated** — superseded by `affinity_scope`; removed in the next\nminor release. Which halves of the relationship line to inject:\n`none | bond | chemistry | both`. Ignored when `affinity_scope` is\npresent. Note the two value spaces do not mix: `\"full\"` here (or\n`\"both\"` under `affinity_scope`) is a 422."
           }
         }
       }

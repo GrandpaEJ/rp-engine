@@ -46,10 +46,6 @@ async fn main() -> Result<()> {
     //                                     (Fly.io release_command)
     //   eros-engine seed-personas <dir>   load every *.toml in <dir> as a
     //                                     persona genome (idempotent on name)
-    //   eros-engine backfill-human-insights  project every companion_insights
-    //                                     row into engine.human_insights
-    //                                     (idempotent UPSERT; manual, never
-    //                                     in release_command)
     //   eros-engine print-openapi         dump the OpenAPI spec to stdout and
     //                                     exit (no DB, no env). Used by the
     //                                     CI drift check.
@@ -62,12 +58,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "/etc/eros-engine/personas".to_string());
             run_seed_personas(&dir).await
         }
-        Some("backfill-human-insights") => run_backfill_human_insights().await,
         Some("print-openapi") => run_print_openapi(),
         Some("serve") | None => run_server().await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>|backfill-human-insights|print-openapi]");
+            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>|print-openapi]");
             std::process::exit(2);
         }
     }
@@ -143,38 +138,6 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
         }
     }
     tracing::info!(inserted, skipped, "seed-personas complete");
-    Ok(())
-}
-
-/// Project every existing `companion_insights` row into `engine.human_insights`.
-/// Idempotent (UPSERT), so re-running is safe. Manual maintenance command —
-/// deliberately NOT wired into the Fly release_command.
-async fn run_backfill_human_insights() -> Result<()> {
-    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-    let pool = eros_engine_store::pool::build(&database_url)
-        .await
-        .context("failed to connect to DATABASE_URL")?;
-    let human_repo = eros_engine_store::human_insight::HumanInsightRepo { pool: &pool };
-
-    let rows: Vec<(uuid::Uuid, serde_json::Value)> =
-        sqlx::query_as("SELECT user_id, insights FROM engine.companion_insights")
-            .fetch_all(&pool)
-            .await
-            .context("load companion_insights for backfill")?;
-
-    let total = rows.len();
-    let mut ok = 0u32;
-    let mut failed = 0u32;
-    for (user_id, insights) in rows {
-        match human_repo.project_from_insights(user_id, &insights).await {
-            Ok(()) => ok += 1,
-            Err(e) => {
-                tracing::warn!(%user_id, "backfill projection failed: {e}");
-                failed += 1;
-            }
-        }
-    }
-    tracing::info!(total, ok, failed, "backfill-human-insights complete");
     Ok(())
 }
 
@@ -295,8 +258,8 @@ async fn run_server() -> Result<()> {
     // missing [tasks.*_extraction] section means that extraction is off — the
     // engine boots and runs without it. A present section with a blank/absent
     // filter_prompt is a misconfiguration we refuse to boot on. Placed in the
-    // serve path only (the print-openapi / backfill subcommands return before
-    // reaching here).
+    // serve path only (the print-openapi subcommand returns before reaching
+    // here).
     if let Err(msg) = model_config.validate_extraction_prompts() {
         anyhow::bail!(msg);
     }
@@ -324,6 +287,14 @@ async fn run_server() -> Result<()> {
     // puts validate_affinity_prompt_unset before validate_prompt_variants: the
     // more specific message is the one the operator gets to see.
     if let Err(msg) = model_config.validate_tier_blocks() {
+        anyhow::bail!(msg);
+    }
+
+    // Sampling knobs (issue #246): an out-of-range value and any knob on
+    // [tasks.embedding] are dead config the provider would clamp, ignore, or
+    // 400 on inconsistently. Sits next to the tier gate because it refuses the
+    // same class — config that parses, boots, and does nothing.
+    if let Err(msg) = model_config.validate_sampling() {
         anyhow::bail!(msg);
     }
 
@@ -415,7 +386,7 @@ async fn run_server() -> Result<()> {
     // Cloned because the next line moves `state` into the router.
     tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
 
-    // companion_insights_snapshot sweeper. Returns immediately when
+    // human_insights_snapshot sweeper. Returns immediately when
     // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
     // chat path is unaffected by snapshot misconfig.
     tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
@@ -525,6 +496,17 @@ mod tests {
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_tier_blocks()
             .expect("shipped example must not carry a tier block on a non-tiering task");
+    }
+
+    /// The shipped example sets sampling knobs on [tasks.chat_companion] only,
+    /// all in range, and none on [tasks.embedding] — it MUST pass the sampling
+    /// boot gate, or `main` bails (#246).
+    #[test]
+    fn shipped_model_config_satisfies_sampling_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_sampling()
+            .expect("shipped example must pass the sampling boot gate");
     }
 
     #[test]

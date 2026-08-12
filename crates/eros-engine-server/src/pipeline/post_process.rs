@@ -6,9 +6,11 @@
 //! memory,insight}.rs` with these OSS-specific changes:
 //!
 //! - All DB writes go through `eros-engine-store` repos (`AffinityRepo`,
-//!   `MemoryRepo`, `InsightRepo`, `ChatRepo`) instead of inline `sqlx::query`.
-//! - `companion_insights` lives in its own table, not on `user_profiles`.
-//!   `InsightRepo::merge` handles the JSONB merge + training-level update.
+//!   `MemoryRepo`, `HumanInsightRepo`, `InsightEventRepo`, `ChatRepo`) instead
+//!   of inline `sqlx::query`.
+//! - Insight extraction (`extract_insights`) writes `human_insights` directly
+//!   via `HumanInsightRepo::apply_extraction`; the audit trail still lands in
+//!   `companion_insights_events`.
 //! - Ghost-streak reset on Reply/Proactive happens in the orchestrator
 //!   (`pipeline::run`) before this function is spawned, since the store
 //!   crate's `AffinityRepo::persist_with_event` deliberately does not
@@ -22,8 +24,8 @@ use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
-use eros_engine_store::human_insight::HumanInsightRepo;
-use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo, InsightRepo};
+use eros_engine_store::human_insight::{existing_as_extraction_json, HumanInsightRepo};
+use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -34,8 +36,8 @@ use crate::state::AppState;
 /// One assistant message persisted during a burst (sync or streaming path).
 /// `action` mirrors the spec's `meta.action_type` discriminator. `message_id`
 /// and `action` are unused by today's per-message side-effects but are kept
-/// on the struct for the audit / lead-score hooks that a future task will
-/// thread per-message.
+/// on the struct for the audit hooks that a future task will thread
+/// per-message.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ProducedMessage {
@@ -183,14 +185,7 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = lead_refresh_applies(plan.action_type);
-    let fut_lead = async {
-        if should_update_lead {
-            refresh_lead_score(&state, session_id, user_id).await;
-        }
-    };
-
-    tokio::join!(fut_insight, fut_memory, fut_affinity, fut_lead);
+    tokio::join!(fut_insight, fut_memory, fut_affinity);
 }
 
 // ─── Affinity persistence ──────────────────────────────────────────
@@ -539,16 +534,6 @@ fn affinity_eval_text(
     String::new()
 }
 
-/// Lead-score refresh applies to text-bearing reply turns and proactive turns.
-/// `reply_image` carries no assistant text (like the insight/memory gating), so
-/// it is excluded; `reply_text_image` IS text-bearing and refreshes lead.
-fn lead_refresh_applies(action: ActionType) -> bool {
-    matches!(
-        action,
-        ActionType::ReplyText | ActionType::ReplyTextImage | ActionType::Proactive
-    )
-}
-
 /// Stable marker explaining why a `message`/`proactive` affinity event carries
 /// no OpenRouter audit trio (`model`/`usage`/`generation_id` all NULL). The trio
 /// is populated only from a *successful* `affinity_evaluation` call; whenever
@@ -682,6 +667,7 @@ async fn evaluate_affinity(
         messages: affinity_eval_messages(persona_name, affinity, user_msg, assistant_msg),
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
         task: Some(AFFINITY_TASK.into()),
@@ -752,7 +738,7 @@ fn call_meta(
     }
 }
 
-/// Top-level entry: extract facts → structured insights → InsightRepo merge.
+/// Top-level entry: extract facts → structured insights → incremental human_insights apply.
 /// Writes one companion_insights_events row per OpenRouter call that returned a
 /// response (facts, then structured), tied by a shared run_id. Fail-open: an
 /// audit-row insert failure only warns and never breaks the turn.
@@ -792,11 +778,11 @@ async fn extract_insights(
         return;
     }
 
-    let insights_repo = InsightRepo { pool: &state.pool };
-    let existing = match insights_repo.load(user_id).await {
-        Ok(row) => row.map(|r| r.insights),
+    let human_repo = HumanInsightRepo { pool: &state.pool };
+    let existing = match human_repo.load(user_id).await {
+        Ok(row) => row.map(|r| existing_as_extraction_json(&r)),
         Err(e) => {
-            tracing::warn!("companion_insights load failed: {e}");
+            tracing::warn!("human_insights load failed: {e}");
             None
         }
     };
@@ -826,17 +812,8 @@ async fn extract_insights(
         return;
     }
 
-    match insights_repo.merge(user_id, new_insights).await {
-        Ok(row) => {
-            let human_repo = HumanInsightRepo { pool: &state.pool };
-            if let Err(e) = human_repo
-                .project_from_insights(user_id, &row.insights)
-                .await
-            {
-                tracing::warn!("human_insights projection failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("companion_insights merge failed: {e}"),
+    if let Err(e) = human_repo.apply_extraction(user_id, &new_insights).await {
+        tracing::warn!("human_insights apply failed: {e}");
     }
 }
 
@@ -900,6 +877,7 @@ async fn extract_facts(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
         task: Some(INSIGHT_TASK.into()),
@@ -990,6 +968,7 @@ async fn extract_structured_insights(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
         task: Some(INSIGHT_TASK.into()),
@@ -1034,31 +1013,6 @@ async fn extract_structured_insights(
                 meta,
             }),
         ),
-    }
-}
-
-// ─── Lead score refresh ────────────────────────────────────────────
-
-async fn refresh_lead_score(state: &AppState, session_id: Uuid, user_id: Uuid) {
-    let repo = InsightRepo { pool: &state.pool };
-    let level = match repo.load(user_id).await {
-        Ok(Some(row)) => row.training_level,
-        Ok(None) => 0.0,
-        Err(e) => {
-            tracing::warn!("lead score refresh: insights load failed: {e}");
-            return;
-        }
-    };
-
-    let new_lead = (level * 10.0).clamp(0.0, 10.0);
-
-    if let Err(e) = sqlx::query("UPDATE engine.chat_sessions SET lead_score = $2 WHERE id = $1")
-        .bind(session_id)
-        .bind(new_lead)
-        .execute(&state.pool)
-        .await
-    {
-        tracing::warn!("lead score update failed: {e}");
     }
 }
 
@@ -1530,6 +1484,15 @@ mod tests {
         assert_eq!(payload["facts"], serde_json::json!(["用户在深圳工作"]));
         assert_eq!(payload["details"][0]["category"], "fact");
         assert_eq!(payload["details"][0]["confidence"], "high");
+
+        // Direct write: the structured result landed in human_insights.
+        let city: Option<String> =
+            sqlx::query_scalar("SELECT city FROM engine.human_insights WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(city.as_deref(), Some("深圳"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1601,15 +1564,6 @@ mod tests {
             Some(serde_json::json!({"facts": [], "details": []})),
             "empty run still writes the uniform object payload"
         );
-    }
-
-    #[test]
-    fn lead_refresh_applies_to_text_bearing_and_proactive_only() {
-        assert!(lead_refresh_applies(ActionType::ReplyText));
-        assert!(lead_refresh_applies(ActionType::ReplyTextImage));
-        assert!(lead_refresh_applies(ActionType::Proactive));
-        assert!(!lead_refresh_applies(ActionType::ReplyImage)); // no assistant text
-        assert!(!lead_refresh_applies(ActionType::Ghost));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Flat, typed projection of the soft (conversation-derived) profile for
-//! user<->user matching. The JSONB->columns mapping lives ONLY in
-//! `project_columns` so the source/trigger can be repointed later without
-//! touching callers. `companion_insights` remains the source of truth.
+//! Flat, typed store of the conversation-derived user profile. Written
+//! incrementally by the insight extractor (`apply_extraction`); read by
+//! prompt building and the profile route.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -77,8 +76,9 @@ fn parse_age_range(prefs: Option<&serde_json::Value>) -> (Option<i32>, Option<i3
         .unwrap_or((None, None))
 }
 
-/// The single definition of the companion_insights JSONB -> human_insights
-/// columns mapping. Pure; unit-tested without a database.
+/// The single definition of the extraction JSONB (the `companion_insights`
+/// schema the extractor emits) -> human_insights columns mapping. Pure;
+/// unit-tested without a database.
 pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
     let prefs = insights.get("matching_preferences");
     let (age_min, age_max) = parse_age_range(prefs);
@@ -107,6 +107,61 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
         future_plans: str_field(insights, "future_plans"),
         finance_status: str_field(insights, "finance_status"),
     }
+}
+
+fn put_str(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: &Option<String>) {
+    if let Some(s) = v {
+        obj.insert(key.into(), serde_json::Value::String(s.clone()));
+    }
+}
+
+/// Reverse projection: rebuild the extraction-schema JSON shape from the
+/// typed row, for the stage-2 prompt's "existing insights" context. Emits
+/// only populated fields (NULL scalars and empty arrays are omitted), and
+/// re-nests the matching trio into `matching_preferences`; `age_range` is
+/// emitted only when both bounds are set. Inverse of `project_columns` for
+/// every value that survives a store round-trip.
+pub fn existing_as_extraction_json(row: &HumanInsightsRow) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    put_str(&mut obj, "city", &row.city);
+    put_str(&mut obj, "location", &row.location);
+    put_str(&mut obj, "hometown", &row.hometown);
+    put_str(&mut obj, "nationality", &row.nationality);
+    put_str(&mut obj, "occupation", &row.occupation);
+    put_str(&mut obj, "mbti_guess", &row.mbti_guess);
+    put_str(&mut obj, "love_values", &row.love_values);
+    put_str(&mut obj, "emotional_needs", &row.emotional_needs);
+    put_str(&mut obj, "life_rhythm", &row.life_rhythm);
+    if !row.interests.is_empty() {
+        obj.insert("interests".into(), serde_json::json!(row.interests));
+    }
+    if !row.personality_traits.is_empty() {
+        obj.insert(
+            "personality_traits".into(),
+            serde_json::json!(row.personality_traits),
+        );
+    }
+    let mut prefs = serde_json::Map::new();
+    put_str(&mut prefs, "preferred_gender", &row.preferred_gender);
+    if let (Some(lo), Some(hi)) = (row.age_min, row.age_max) {
+        prefs.insert("age_range".into(), serde_json::json!([lo, hi]));
+    }
+    if !row.deal_breakers.is_empty() {
+        prefs.insert("deal_breakers".into(), serde_json::json!(row.deal_breakers));
+    }
+    if !prefs.is_empty() {
+        obj.insert(
+            "matching_preferences".into(),
+            serde_json::Value::Object(prefs),
+        );
+    }
+    put_str(&mut obj, "education", &row.education);
+    put_str(&mut obj, "family", &row.family);
+    put_str(&mut obj, "relationship_history", &row.relationship_history);
+    put_str(&mut obj, "social_pattern", &row.social_pattern);
+    put_str(&mut obj, "future_plans", &row.future_plans);
+    put_str(&mut obj, "finance_status", &row.finance_status);
+    serde_json::Value::Object(obj)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -141,10 +196,12 @@ pub struct HumanInsightRepo<'a> {
 }
 
 impl<'a> HumanInsightRepo<'a> {
-    /// Project a companion_insights JSONB blob into the flat matching row and
-    /// UPSERT. Full-overwrite (not field-merge): companion_insights already
-    /// holds the cumulatively merged state, so each call writes it whole.
-    pub async fn project_from_insights(
+    /// Apply one extraction result incrementally: extracted scalars overwrite,
+    /// absent/null scalars keep the stored value; arrays overwrite only when
+    /// the extraction produced a non-empty array. Single statement — no
+    /// read-modify-write, so concurrent extractions degrade to column-level
+    /// (not whole-row) last-write-wins. There is deliberately no erase path.
+    pub async fn apply_extraction(
         &self,
         user_id: Uuid,
         insights: &serde_json::Value,
@@ -160,27 +217,30 @@ impl<'a> HumanInsightRepo<'a> {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
                      $17, $18, $19, $20, $21, $22) \
              ON CONFLICT (user_id) DO UPDATE SET \
-                 city                 = EXCLUDED.city, \
-                 occupation           = EXCLUDED.occupation, \
-                 mbti_guess           = EXCLUDED.mbti_guess, \
-                 love_values          = EXCLUDED.love_values, \
-                 emotional_needs      = EXCLUDED.emotional_needs, \
-                 life_rhythm          = EXCLUDED.life_rhythm, \
-                 interests            = EXCLUDED.interests, \
-                 personality_traits   = EXCLUDED.personality_traits, \
-                 preferred_gender     = EXCLUDED.preferred_gender, \
-                 age_min              = EXCLUDED.age_min, \
-                 age_max              = EXCLUDED.age_max, \
-                 deal_breakers        = EXCLUDED.deal_breakers, \
-                 location             = EXCLUDED.location, \
-                 hometown             = EXCLUDED.hometown, \
-                 nationality          = EXCLUDED.nationality, \
-                 education            = EXCLUDED.education, \
-                 family               = EXCLUDED.family, \
-                 relationship_history = EXCLUDED.relationship_history, \
-                 social_pattern       = EXCLUDED.social_pattern, \
-                 future_plans         = EXCLUDED.future_plans, \
-                 finance_status       = EXCLUDED.finance_status, \
+                 city                 = COALESCE(EXCLUDED.city, human_insights.city), \
+                 occupation           = COALESCE(EXCLUDED.occupation, human_insights.occupation), \
+                 mbti_guess           = COALESCE(EXCLUDED.mbti_guess, human_insights.mbti_guess), \
+                 love_values          = COALESCE(EXCLUDED.love_values, human_insights.love_values), \
+                 emotional_needs      = COALESCE(EXCLUDED.emotional_needs, human_insights.emotional_needs), \
+                 life_rhythm          = COALESCE(EXCLUDED.life_rhythm, human_insights.life_rhythm), \
+                 interests            = CASE WHEN EXCLUDED.interests = '{}' \
+                                             THEN human_insights.interests ELSE EXCLUDED.interests END, \
+                 personality_traits   = CASE WHEN EXCLUDED.personality_traits = '{}' \
+                                             THEN human_insights.personality_traits ELSE EXCLUDED.personality_traits END, \
+                 preferred_gender     = COALESCE(EXCLUDED.preferred_gender, human_insights.preferred_gender), \
+                 age_min              = COALESCE(EXCLUDED.age_min, human_insights.age_min), \
+                 age_max              = COALESCE(EXCLUDED.age_max, human_insights.age_max), \
+                 deal_breakers        = CASE WHEN EXCLUDED.deal_breakers = '{}' \
+                                             THEN human_insights.deal_breakers ELSE EXCLUDED.deal_breakers END, \
+                 location             = COALESCE(EXCLUDED.location, human_insights.location), \
+                 hometown             = COALESCE(EXCLUDED.hometown, human_insights.hometown), \
+                 nationality          = COALESCE(EXCLUDED.nationality, human_insights.nationality), \
+                 education            = COALESCE(EXCLUDED.education, human_insights.education), \
+                 family               = COALESCE(EXCLUDED.family, human_insights.family), \
+                 relationship_history = COALESCE(EXCLUDED.relationship_history, human_insights.relationship_history), \
+                 social_pattern       = COALESCE(EXCLUDED.social_pattern, human_insights.social_pattern), \
+                 future_plans         = COALESCE(EXCLUDED.future_plans, human_insights.future_plans), \
+                 finance_status       = COALESCE(EXCLUDED.finance_status, human_insights.finance_status), \
                  updated_at           = now()",
         )
         .bind(user_id)
@@ -217,6 +277,24 @@ impl<'a> HumanInsightRepo<'a> {
         .bind(user_id)
         .fetch_optional(self.pool)
         .await
+    }
+
+    /// Append one snapshot row per human_insights record at the given
+    /// instant. `snapshot` is `to_jsonb(row)` — self-contained, and future
+    /// column additions flow through with no snapshot migration. Single
+    /// server-side INSERT … SELECT; returns rows written.
+    pub async fn snapshot_all_users(
+        &self,
+        captured_at: DateTime<Utc>,
+    ) -> Result<usize, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO engine.human_insights_snapshot (user_id, snapshot, captured_at)
+             SELECT hi.user_id, to_jsonb(hi), $1 FROM engine.human_insights hi",
+        )
+        .bind(captured_at)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() as usize)
     }
 }
 
@@ -340,38 +418,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn project_creates_then_overwrites(pool: PgPool) {
-        let repo = HumanInsightRepo { pool: &pool };
-        let user_id = Uuid::new_v4();
-
-        repo.project_from_insights(
-            user_id,
-            &serde_json::json!({ "city": "Shanghai", "interests": ["coffee"] }),
-        )
-        .await
-        .unwrap();
-        let first = repo.load(user_id).await.unwrap().unwrap();
-        assert_eq!(first.city.as_deref(), Some("Shanghai"));
-        assert_eq!(first.interests, vec!["coffee"]);
-
-        // Full-overwrite: a field absent in the new blob becomes NULL.
-        repo.project_from_insights(
-            user_id,
-            &serde_json::json!({ "interests": ["tea", "wine"] }),
-        )
-        .await
-        .unwrap();
-        let second = repo.load(user_id).await.unwrap().unwrap();
-        assert_eq!(second.city, None, "absent field overwrites to NULL");
-        assert_eq!(second.interests, vec!["tea", "wine"]);
-        assert!(second.updated_at >= first.updated_at);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
     async fn arrays_roundtrip(pool: PgPool) {
         let repo = HumanInsightRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        repo.project_from_insights(
+        repo.apply_extraction(
             user_id,
             &serde_json::json!({
                 "interests": ["a", "b"],
@@ -391,7 +441,7 @@ mod tests {
     async fn geo_fields_roundtrip(pool: PgPool) {
         let repo = HumanInsightRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        repo.project_from_insights(
+        repo.apply_extraction(
             user_id,
             &serde_json::json!({
                 "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
@@ -410,7 +460,7 @@ mod tests {
     async fn expansion_fields_roundtrip(pool: PgPool) {
         let repo = HumanInsightRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        repo.project_from_insights(
+        repo.apply_extraction(
             user_id,
             &serde_json::json!({
                 "education": "本科在读",
@@ -431,13 +481,12 @@ mod tests {
         assert_eq!(row.future_plans.as_deref(), Some("准备考研"));
         assert_eq!(row.finance_status.as_deref(), Some("靠奖学金和兼职"));
 
-        // Full-overwrite semantics apply to the new columns too.
-        repo.project_from_insights(user_id, &serde_json::json!({ "city": "上海" }))
+        repo.apply_extraction(user_id, &serde_json::json!({ "city": "上海" }))
             .await
             .unwrap();
-        let wiped = repo.load(user_id).await.unwrap().unwrap();
-        assert_eq!(wiped.education, None, "absent key overwrites to NULL");
-        assert_eq!(wiped.finance_status, None);
+        let kept = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(kept.education.as_deref(), Some("本科在读"), "absent keeps");
+        assert_eq!(kept.finance_status.as_deref(), Some("靠奖学金和兼职"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -445,13 +494,13 @@ mod tests {
         let repo = HumanInsightRepo { pool: &pool };
         let want = Uuid::new_v4();
         let other = Uuid::new_v4();
-        repo.project_from_insights(
+        repo.apply_extraction(
             want,
             &serde_json::json!({ "interests": ["coffee", "hiking"] }),
         )
         .await
         .unwrap();
-        repo.project_from_insights(other, &serde_json::json!({ "interests": ["gaming"] }))
+        repo.apply_extraction(other, &serde_json::json!({ "interests": ["gaming"] }))
             .await
             .unwrap();
 
@@ -470,75 +519,244 @@ mod tests {
         assert!(repo.load(Uuid::new_v4()).await.unwrap().is_none());
     }
 
-    /// The canonical backfill SQL, embedded from the migration file so the test
-    /// always exercises the real statement (no drift between test and migration).
-    const BACKFILL_SQL: &str = include_str!("../migrations/0018_backfill_human_insights.sql");
-
     #[sqlx::test(migrations = "./migrations")]
-    async fn backfill_sql_projects_companion_insights(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        // Seed a companion_insights row directly (simulating a legacy user with
-        // no human_insights mirror yet).
-        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(serde_json::json!({
-                "city": "广州",
-                "interests": ["游泳", "读书"],
-                "personality_traits": ["开朗"],
-                "matching_preferences": { "age_range": [22, 30], "preferred_gender": "female", "deal_breakers": ["抽烟"] }
-            }))
-            .execute(&pool)
+    async fn snapshot_all_users_writes_one_row_per_user_at_same_ts(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        repo.apply_extraction(u1, &serde_json::json!({ "city": "深圳" }))
+            .await
+            .unwrap();
+        repo.apply_extraction(u2, &serde_json::json!({ "occupation": "工程师" }))
             .await
             .unwrap();
 
-        // Re-run the canonical migration (idempotent) now that a row exists.
-        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
+        let t = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let n = repo.snapshot_all_users(t).await.unwrap();
+        assert_eq!(n, 2, "one row per human_insights row");
 
-        let row = HumanInsightRepo { pool: &pool }
-            .load(user_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.city.as_deref(), Some("广州"));
-        assert_eq!(row.interests, vec!["游泳".to_string(), "读书".to_string()]);
-        assert_eq!(row.personality_traits, vec!["开朗".to_string()]);
-        assert_eq!(row.age_min, Some(22));
-        assert_eq!(row.age_max, Some(30));
-        assert_eq!(row.preferred_gender.as_deref(), Some("female"));
-        assert_eq!(row.deal_breakers, vec!["抽烟".to_string()]);
+        let rows: Vec<(Uuid, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT user_id, snapshot, captured_at
+               FROM engine.human_insights_snapshot ORDER BY user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (uid, snap, ts) in &rows {
+            assert_eq!(*ts, t, "every row in the same fire shares captured_at");
+            assert_eq!(
+                snap["user_id"],
+                serde_json::json!(uid),
+                "snapshot is the full row"
+            );
+        }
+        let by_u1 = rows.iter().find(|(u, _, _)| u == &u1).unwrap();
+        assert_eq!(by_u1.1["city"], "深圳");
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn backfill_sql_tolerates_malformed_fields(pool: PgPool) {
+    async fn snapshot_all_users_with_empty_table_writes_nothing(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let t = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        assert_eq!(repo.snapshot_all_users(t).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn existing_as_extraction_json_emits_only_populated() {
+        let row = HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: Some("深圳".into()),
+            location: None,
+            hometown: None,
+            nationality: None,
+            occupation: Some("后端工程师".into()),
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec!["手冲咖啡".into()],
+            personality_traits: vec![],
+            preferred_gender: Some("female".into()),
+            age_min: Some(22),
+            age_max: Some(30),
+            deal_breakers: vec![],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let v = existing_as_extraction_json(&row);
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["city"], "深圳");
+        assert_eq!(obj["occupation"], "后端工程师");
+        assert_eq!(obj["interests"], serde_json::json!(["手冲咖啡"]));
+        // Empty arrays and NULL scalars are omitted entirely.
+        assert!(!obj.contains_key("personality_traits"));
+        assert!(!obj.contains_key("mbti_guess"));
+        assert!(!obj.contains_key("location"));
+        // user_id / updated_at are row bookkeeping, not insight fields.
+        assert!(!obj.contains_key("user_id"));
+        assert!(!obj.contains_key("updated_at"));
+        // Matching trio re-nests into matching_preferences.
+        let prefs = obj["matching_preferences"].as_object().unwrap();
+        assert_eq!(prefs["preferred_gender"], "female");
+        assert_eq!(prefs["age_range"], serde_json::json!([22, 30]));
+        assert!(!prefs.contains_key("deal_breakers"));
+    }
+
+    #[test]
+    fn existing_as_extraction_json_empty_row_is_empty_object() {
+        let row = HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: None,
+            location: None,
+            hometown: None,
+            nationality: None,
+            occupation: None,
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec![],
+            personality_traits: vec![],
+            preferred_gender: None,
+            age_min: None,
+            age_max: None,
+            deal_breakers: vec![],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(existing_as_extraction_json(&row), serde_json::json!({}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_creates_then_merges_incrementally(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        // Non-array scalars where arrays are expected (would crash
-        // jsonb_array_elements_text without the jsonb_typeof guards), plus a
-        // non-array age_range — all degrade to NULL / empty, no abort.
-        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(serde_json::json!({
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": "深圳", "interests": ["手冲咖啡"] }),
+        )
+        .await
+        .unwrap();
+        let first = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(first.city.as_deref(), Some("深圳"));
+        assert_eq!(first.interests, vec!["手冲咖啡"]);
+
+        // Second extraction touches OTHER fields: previous values survive.
+        repo.apply_extraction(user_id, &serde_json::json!({ "occupation": "后端工程师" }))
+            .await
+            .unwrap();
+        let second = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(
+            second.city.as_deref(),
+            Some("深圳"),
+            "absent scalar keeps old value"
+        );
+        assert_eq!(
+            second.interests,
+            vec!["手冲咖啡"],
+            "absent array keeps old value"
+        );
+        assert_eq!(second.occupation.as_deref(), Some("后端工程师"));
+        assert!(second.updated_at >= first.updated_at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_present_overwrites_absent_keeps(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({
                 "city": "深圳",
-                "interests": "游泳、读书",
-                "personality_traits": "开朗",
-                "matching_preferences": { "age_range": "not-an-array", "deal_breakers": "抽烟" }
-            }))
-            .execute(&pool)
-            .await
-            .unwrap();
+                "interests": ["a"],
+                "matching_preferences": { "preferred_gender": "any", "age_range": [20, 28] }
+            }),
+        )
+        .await
+        .unwrap();
 
-        // The canonical migration must NOT error on these malformed fields.
-        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({
+                "city": "上海",
+                "interests": ["b", "c"],
+                "city_null_probe": null
+            }),
+        )
+        .await
+        .unwrap();
 
-        let row = HumanInsightRepo { pool: &pool }
-            .load(user_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.city.as_deref(), Some("深圳"));
-        assert_eq!(row.age_min, None);
-        assert_eq!(row.age_max, None);
-        assert!(row.interests.is_empty());
-        assert!(row.personality_traits.is_empty());
-        assert!(row.deal_breakers.is_empty());
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.city.as_deref(),
+            Some("上海"),
+            "present scalar overwrites"
+        );
+        assert_eq!(row.interests, vec!["b", "c"], "non-empty array overwrites");
+        assert_eq!(
+            row.preferred_gender.as_deref(),
+            Some("any"),
+            "untouched nested field kept"
+        );
+        assert_eq!(row.age_min, Some(20));
+        assert_eq!(row.age_max, Some(28));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_null_and_empty_array_cannot_erase(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": "深圳", "interests": ["a"] }),
+        )
+        .await
+        .unwrap();
+        // Explicit null / empty array behave like absent: no erase path.
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": null, "interests": [] }),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(row.city.as_deref(), Some("深圳"), "null does not erase");
+        assert_eq!(row.interests, vec!["a"], "empty array does not erase");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_roundtrips_through_reverse_projection(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let input = serde_json::json!({
+            "city": "深圳",
+            "hometown": "长沙",
+            "interests": ["爬山", "手冲咖啡"],
+            "education": "985 本科计算机",
+            "matching_preferences": {
+                "preferred_gender": "female",
+                "age_range": [22, 30],
+                "deal_breakers": ["抽烟"]
+            }
+        });
+        repo.apply_extraction(user_id, &input).await.unwrap();
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        // The reverse projection reproduces exactly what was stored.
+        assert_eq!(existing_as_extraction_json(&row), input);
     }
 }

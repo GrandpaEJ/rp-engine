@@ -71,11 +71,10 @@ pub struct ChatRequest {
     pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
-    /// Optional sampling knobs. `None` ⇒ the wire param is omitted, so a
-    /// deployment that sets none produces a byte-identical body to today.
-    pub top_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
+    /// Optional sampling knobs, resolved from the task block. `None` on a
+    /// field ⇒ that wire param is omitted, so a deployment that sets none
+    /// produces a byte-identical body to today.
+    pub sampling: crate::model_config::Sampling,
     pub max_tokens: u32,
     /// Opaque OpenRouter wire passthrough — `user` field. Engine never
     /// inspects this; callers are responsible for hashing PII out.
@@ -114,6 +113,9 @@ pub struct VisionRequest {
     pub temperature: f32,
     pub max_tokens: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs (issue #246). The describe call is an ordinary
+    /// chat/completions request in every respect but its `messages` shape.
+    pub sampling: crate::model_config::Sampling,
 }
 
 /// Task name the vision pre-stage matches body rules under. `VisionRequest`
@@ -147,6 +149,18 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
             body["reasoning"] = v;
         }
     }
+    // Sampling knobs are omitted entirely when unset, mirroring WireRequest's
+    // `skip_serializing_if` — an untuned deployment must keep producing a
+    // byte-identical body (issue #246).
+    let mut put = |k: &str, v: Option<f32>| {
+        if let Some(x) = v {
+            body[k] = serde_json::json!(x);
+        }
+    };
+    put("top_p", req.sampling.top_p);
+    put("frequency_penalty", req.sampling.frequency_penalty);
+    put("presence_penalty", req.sampling.presence_penalty);
+    put("repetition_penalty", req.sampling.repetition_penalty);
     body
 }
 
@@ -291,6 +305,8 @@ struct WireRequest<'a> {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repetition_penalty: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
@@ -683,9 +699,7 @@ impl OpenRouterClient {
                     &req.messages,
                     req.temperature,
                     req.max_tokens,
-                    req.top_p,
-                    req.frequency_penalty,
-                    req.presence_penalty,
+                    req.sampling,
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
@@ -923,9 +937,7 @@ impl OpenRouterClient {
         messages: &[ChatMessage],
         temperature: f32,
         max_tokens: u32,
-        top_p: Option<f32>,
-        frequency_penalty: Option<f32>,
-        presence_penalty: Option<f32>,
+        sampling: crate::model_config::Sampling,
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -938,9 +950,10 @@ impl OpenRouterClient {
             model: &bare_model,
             messages,
             temperature,
-            top_p,
-            frequency_penalty,
-            presence_penalty,
+            top_p: sampling.top_p,
+            frequency_penalty: sampling.frequency_penalty,
+            presence_penalty: sampling.presence_penalty,
+            repetition_penalty: sampling.repetition_penalty,
             max_tokens,
             stream: false,
             user: req_user,
@@ -1075,9 +1088,10 @@ impl OpenRouterClient {
             model: &bare_model,
             messages: &req.messages,
             temperature: req.temperature,
-            top_p: req.top_p,
-            frequency_penalty: req.frequency_penalty,
-            presence_penalty: req.presence_penalty,
+            top_p: req.sampling.top_p,
+            frequency_penalty: req.sampling.frequency_penalty,
+            presence_penalty: req.sampling.presence_penalty,
+            repetition_penalty: req.sampling.repetition_penalty,
             max_tokens: req.max_tokens,
             stream: true,
             user: req.user.as_deref(),
@@ -1297,6 +1311,50 @@ mod tests {
         assert!(body.get("never").is_none(), "non-matching rule skipped");
     }
 
+    #[test]
+    fn body_rules_override_max_tokens_and_sampling() {
+        // Companion lock to the test above, which only covers `temperature`.
+        // `[[providers.<name>.body]]` params beat every engine-built wire
+        // field; only the three engine-owned structural keys
+        // (model/messages/stream) are exempt, and those are refused at boot.
+        // Issue #246 leans on this being true for max_tokens and the four
+        // sampling knobs, so it is locked rather than assumed.
+        // Every key the rule touches is already present, so this proves
+        // OVERRIDE rather than mere insertion.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "temperature": 0.5,
+            "max_tokens": 200,
+            "top_p": 0.9,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let rules = [rule(
+            Some(&["chat_image_prompt_compose"]),
+            serde_json::json!({
+                "temperature": 0.11,
+                "max_tokens": 900,
+                "top_p": 0.5,
+                "frequency_penalty": 0.75,
+                "presence_penalty": -0.25,
+                "repetition_penalty": 1.25
+            }),
+        )];
+        apply_body_rules(&mut body, &rules, Some("chat_image_prompt_compose"));
+        // All six overridable keys the docs name, not a sample of them.
+        assert_eq!(body["temperature"], 0.11);
+        assert_eq!(body["max_tokens"], 900);
+        assert_eq!(body["top_p"], 0.5);
+        assert_eq!(body["frequency_penalty"], 0.75);
+        assert_eq!(body["presence_penalty"], -0.25);
+        assert_eq!(body["repetition_penalty"], 1.25);
+        assert_eq!(body["model"], "m", "engine-owned key untouched");
+    }
+
     #[tokio::test]
     async fn client_sends_configured_openrouter_headers() {
         let server = MockServer::start().await;
@@ -1470,6 +1528,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -1514,6 +1573,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -2257,6 +2317,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2279,6 +2340,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2664,6 +2726,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2685,6 +2748,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3153,6 +3217,7 @@ data: [DONE]\n\n";
                 temperature: 0.0,
                 max_tokens: 64,
                 reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
             })
             .await
             .expect("garbled vision is repaired into Ok, not dropped");
@@ -3204,6 +3269,7 @@ data: [DONE]\n\n";
                     enabled: Some(false),
                     ..Default::default()
                 }),
+                sampling: crate::model_config::Sampling::default(),
             })
             .await
             .expect("vision call succeeds");
@@ -3239,6 +3305,7 @@ data: [DONE]\n\n";
             top_p: Some(0.9),
             frequency_penalty: Some(0.4),
             presence_penalty: Some(0.2),
+            repetition_penalty: Some(1.15),
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3251,6 +3318,39 @@ data: [DONE]\n\n";
         assert!(s.contains("\"top_p\":0.9"), "{s}");
         assert!(s.contains("\"frequency_penalty\":0.4"), "{s}");
         assert!(s.contains("\"presence_penalty\":0.2"), "{s}");
+        assert!(s.contains("\"repetition_penalty\":1.15"), "{s}");
+    }
+
+    #[test]
+    fn unset_sampling_serializes_byte_identically_to_the_pre_246_body() {
+        // Stronger than the key-absence checks below: #246 promises a
+        // deployment that sets no sampling knob keeps producing the EXACT
+        // body it produced before. Key absence alone would still pass if
+        // field order or numeric formatting drifted, so compare bytes.
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            response_format: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.8,"max_tokens":16}"#
+        );
     }
 
     #[test]
@@ -3266,6 +3366,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3283,6 +3384,84 @@ data: [DONE]\n\n";
         assert!(
             !s.contains("presence_penalty"),
             "unset presence_penalty must be omitted: {s}"
+        );
+        assert!(
+            !s.contains("repetition_penalty"),
+            "unset repetition_penalty must be omitted: {s}"
+        );
+    }
+
+    #[test]
+    fn vision_body_carries_sampling_when_set_and_omits_when_unset() {
+        let base = VisionRequest {
+            model: "m".into(),
+            fallback_model: vec![],
+            system_prompt: "sys".into(),
+            image_url: "https://x/y.png".into(),
+            caption: None,
+            temperature: 0.5,
+            max_tokens: 10,
+            reasoning: None,
+            sampling: crate::model_config::Sampling::default(),
+        };
+
+        let bare = build_vision_body(&base, "m");
+        let o = bare.as_object().unwrap();
+        for k in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            assert!(!o.contains_key(k), "unset {k} must be omitted: {bare}");
+        }
+
+        let tuned = VisionRequest {
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                frequency_penalty: Some(0.4),
+                presence_penalty: Some(0.2),
+                repetition_penalty: Some(1.15),
+            },
+            ..base
+        };
+        let body = build_vision_body(&tuned, "m");
+        // Compared through the f32→f64 widening `serde_json::json!` applies.
+        // The vision body is a hand-built `Value`, so every float in it takes
+        // that widening — `temperature` already did before this change. The
+        // typed chat path formats f32 with ryu instead and emits `0.9`; the
+        // difference is representational only, both parse to the same float.
+        let f = |v: f32| serde_json::json!(v);
+        assert_eq!(body["top_p"], f(0.9));
+        assert_eq!(body["frequency_penalty"], f(0.4));
+        assert_eq!(body["presence_penalty"], f(0.2));
+        assert_eq!(body["repetition_penalty"], f(1.15));
+    }
+
+    #[test]
+    fn chat_request_default_still_works_with_sampling() {
+        // The new grouped field must not break `..Default::default()`, which
+        // every ChatRequest literal in the server crate relies on.
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.5,
+            max_tokens: 10,
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                repetition_penalty: Some(1.15),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(req.sampling.repetition_penalty, Some(1.15));
+        assert_eq!(req.sampling.frequency_penalty, None);
+        assert_eq!(
+            ChatRequest::default().sampling,
+            crate::model_config::Sampling::default()
         );
     }
 
@@ -3334,6 +3513,7 @@ data: [DONE]\n\n";
             top_p: Some(0.9),
             frequency_penalty: Some(0.1),
             presence_penalty: Some(0.1),
+            repetition_penalty: Some(1.15),
             max_tokens: 10,
             stream: true,
             user: Some("u"),
@@ -3344,13 +3524,16 @@ data: [DONE]\n\n";
         }
         .for_endpoint(&ep);
         let v = serde_json::to_value(&wire).unwrap();
-        const ALLOW: [&str; 10] = [
+        const ALLOW: [&str; 11] = [
             "model",
             "messages",
             "temperature",
             "top_p",
             "frequency_penalty",
             "presence_penalty",
+            // Standard OpenAI-format field, not an OpenRouter extension — it
+            // belongs in the allow list, not for_endpoint's drop list (#246).
+            "repetition_penalty",
             "max_tokens",
             "stream",
             "user",
@@ -3387,16 +3570,27 @@ data: [DONE]\n\n";
                 enabled: Some(false),
                 ..Default::default()
             }),
+            // Set, so the ALLOW lock below actually exercises them — all four
+            // are standard OpenAI fields and must survive the strip (#246).
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.1),
+                repetition_penalty: Some(1.15),
+            },
         };
         let mut body = build_vision_body(&req, "m");
         strip_openrouter_vision_fields(&mut body);
-        const ALLOW: [&str; 10] = [
+        const ALLOW: [&str; 11] = [
             "model",
             "messages",
             "temperature",
             "top_p",
             "frequency_penalty",
             "presence_penalty",
+            // Standard OpenAI-format field, not an OpenRouter extension — it
+            // belongs in the allow list, not for_endpoint's drop list (#246).
+            "repetition_penalty",
             "max_tokens",
             "stream",
             "user",
@@ -3429,6 +3623,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 10,
             stream: false,
             user: None,
@@ -4012,6 +4207,7 @@ data: [DONE]\n\n";
                 enabled: Some(false),
                 ..Default::default()
             }),
+            sampling: crate::model_config::Sampling::default(),
         }
     }
 

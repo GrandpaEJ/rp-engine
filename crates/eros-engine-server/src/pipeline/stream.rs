@@ -81,9 +81,6 @@ pub enum ProtocolFrame {
         ghost_fallback: bool,
     },
     Final {
-        lead_score: f64,
-        should_show_cta: bool,
-        agent_training_level: f64,
         filtered: bool,
         // null when no trait injected; always present (no skip_serializing_if).
         prompt_injected: Option<Vec<String>>,
@@ -1403,6 +1400,7 @@ async fn run_output_filter(
             ],
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
+            sampling: f.sampling,
             reasoning: f.reasoning.clone(),
             task: Some("chat_output_filter".into()),
             ..Default::default()
@@ -1679,6 +1677,7 @@ async fn run_pde_decision(
             ],
             temperature: p.temperature as f32,
             max_tokens: p.max_tokens,
+            sampling: p.sampling,
             reasoning: p.reasoning.clone(),
             response_format: response_format.clone(),
             task: Some("pde_decision".into()),
@@ -1925,6 +1924,19 @@ fn build_pde_ctx(
     } else {
         format!("{brief}\n\n")
     };
+    // Precomputed relationship buckets. The judge acts on stated facts but is
+    // unreliable at deriving them: told to fold the six axes itself it mis-ranks
+    // deep relationships as shallow, so both buckets arrive as engine-owned
+    // lines. Unconditional, like 图片能力 — the low end of either scale is
+    // itself a signal, so a missing line must never read as "rung 1".
+    let rung = a.intimacy_rung();
+    let bond = a.bond_score();
+    let chemistry = a.chemistry_score();
+    let patience_band = match a.patience_band() {
+        eros_engine_core::affinity::PatienceBand::High => "高",
+        eros_engine_core::affinity::PatienceBand::Mid => "中",
+        eros_engine_core::affinity::PatienceBand::Low => "低",
+    };
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
@@ -1950,6 +1962,8 @@ fn build_pde_ctx(
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
+         [亲密度] 当前档位=第 {rung} 档（bond={bond:.2} chemistry={chemistry:.2}）\n\
+         [耐心] 当前档位={patience_band}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
@@ -2085,6 +2099,7 @@ async fn run_vision(
             temperature: v.temperature as f32,
             max_tokens: v.max_tokens,
             reasoning: v.reasoning.clone(),
+            sampling: v.sampling,
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req))
             .await
@@ -2323,6 +2338,7 @@ async fn run_input_filter(
             ],
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
+            sampling: f.sampling,
             reasoning: f.reasoning.clone(),
             task: Some("chat_input_filter".into()),
             ..Default::default()
@@ -2498,6 +2514,7 @@ pub(crate) async fn run_image_prompt_compose(
             ],
             temperature: c.temperature as f32,
             max_tokens: c.max_tokens,
+            sampling: c.sampling,
             reasoning: c.reasoning.clone(),
             task: Some("chat_image_prompt_compose".into()),
             ..Default::default()
@@ -3259,7 +3276,7 @@ pub fn run_stream(
                     generation_id: None,
                     ghost_fallback: false,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
             ActionType::ProductQa => {
@@ -3325,6 +3342,7 @@ pub fn run_stream(
                     messages,
                     temperature: p.temperature as f32,
                     max_tokens: p.max_tokens,
+                    sampling: p.sampling,
                     reasoning: p.reasoning.clone(),
                     task: Some("chat_product_qa".into()),
                     ..Default::default()
@@ -3485,7 +3503,7 @@ pub fn run_stream(
                     generation_id: last_gen_id,
                     ghost_fallback: false,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
@@ -3591,17 +3609,8 @@ pub fn run_stream(
                     {
                         tracing::warn!("stream: ghost streak reset failed: {e}");
                     }
-                    let final_frame = compute_final_frame(
-                        &state,
-                        user_msg.session_id,
-                        user_msg.user_id,
-                        false,
-                        None,
-                        user_msg.tier.clone(),
-                        0,
-                        0,
-                    )
-                    .await;
+                    let final_frame =
+                        build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                     yield final_frame;
 
                     let state_bg = (*state).clone();
@@ -3966,17 +3975,13 @@ pub fn run_stream(
                     }
                 }
 
-                let final_frame = compute_final_frame(
-                    &state,
-                    user_msg.session_id,
-                    user_msg.user_id,
+                let final_frame = build_final_frame(
                     did_filter,
                     prompt_injected.clone(),
                     user_msg.tier.clone(),
                     retries_chat,
                     retries_filter,
-                )
-                .await;
+                );
                 yield final_frame;
 
                 // Spawn post-process; do not await.
@@ -4019,50 +4024,23 @@ pub fn run_stream(
             }
             _ => {
                 // Proactive and any future variants: Final-only.
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
         }
     }
 }
 
-/// Compute the spec's `final` frame from current session/user state.
-#[allow(clippy::too_many_arguments)]
-async fn compute_final_frame(
-    state: &AppState,
-    session_id: Uuid,
-    user_id: Uuid,
+/// Build the spec's `final` frame. Assembled purely from turn-local values
+/// since the lead/CTA teardown (spec 2026-08-11) — no DB reads.
+fn build_final_frame(
     filtered: bool,
     prompt_injected: Option<Vec<String>>,
     tier: Option<String>,
     retries_chat: u32,
     retries_filter: u32,
 ) -> ProtocolFrame {
-    let lead_score: f64 =
-        sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
-
-    let training_level: f64 = match (eros_engine_store::insight::InsightRepo { pool: &state.pool })
-        .load(user_id)
-        .await
-    {
-        Ok(Some(row)) => eros_engine_store::insight::compute_training_level(&row.insights),
-        _ => 0.0,
-    };
-    let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
-    // Normalise lead_score from 0..10 to 0..1 to match the spec's declared
-    // [0.0, 1.0] range. Operator dashboards still see the 0..10 raw value
-    // via the sync /message handler.
-    let normalised_lead = (lead_score / 10.0).clamp(0.0, 1.0);
     ProtocolFrame::Final {
-        lead_score: normalised_lead,
-        should_show_cta,
-        agent_training_level: training_level,
         filtered,
         prompt_injected,
         tier,
@@ -4074,12 +4052,16 @@ async fn compute_final_frame(
 /// Build a frame stream from previously persisted assistant rows for a
 /// given user_message_id. The chain is given in original chronological
 /// order; emits one (meta, single-delta, done) trio per row, then one
-/// `final` computed from current session state. Ghost replay emits a
-/// synthetic Meta+Done(no usage, not truncated) followed by Final.
+/// `final` assembled from turn-local constants (no DB reads — see
+/// `build_final_frame`). Ghost replay emits a synthetic Meta+Done(no usage,
+/// not truncated) followed by Final.
 pub fn replay_stream(
     state: Arc<AppState>,
-    session_id: Uuid,
-    user_id: Uuid,
+    // Unused since the lead/CTA teardown (spec 2026-08-11): `build_final_frame`
+    // no longer needs session/user state. Kept in the signature — every call
+    // site already has both values in scope — rather than churning every caller.
+    _session_id: Uuid,
+    _user_id: Uuid,
     ghost: bool,
     rows: Vec<eros_engine_store::chat::ChatMessage>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
@@ -4179,7 +4161,7 @@ pub fn replay_stream(
                 return;
             }
         }
-        let final_frame = compute_final_frame(&state, session_id, user_id, false, None, None, 0, 0).await;
+        let final_frame = build_final_frame(false, None, None, 0, 0);
         yield final_frame;
     }
 }
@@ -4468,9 +4450,6 @@ mod tests {
     #[test]
     fn final_frame_carries_filter_and_status_fields() {
         let f = ProtocolFrame::Final {
-            lead_score: 0.71,
-            should_show_cta: false,
-            agent_training_level: 0.42,
             filtered: true,
             prompt_injected: Some(vec!["nsfw_boost".into()]),
             tier: Some("gold".into()),
@@ -4486,9 +4465,6 @@ mod tests {
         assert_eq!(v["retries_filter"], 0);
 
         let f2 = ProtocolFrame::Final {
-            lead_score: 0.0,
-            should_show_cta: false,
-            agent_training_level: 0.0,
             filtered: false,
             prompt_injected: None,
             tier: None,
@@ -11423,6 +11399,88 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Both engine-owned bucket lines render between [关系状态] and [信号],
+    /// with the composites at the same {:.2} as the axes above them.
+    #[test]
+    fn pde_ctx_renders_intimacy_and_patience_buckets() {
+        let mut input = fixture_decision_input();
+        input.affinity.warmth = 0.9;
+        input.affinity.trust = 0.9;
+        input.affinity.intrigue = 0.9;
+        input.affinity.intimacy = 0.0;
+        input.affinity.tension = 0.0; // bond 0.90, chemistry 0.30
+        input.affinity.patience = 0.8;
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+        assert!(
+            ctx.contains("[亲密度] 当前档位=第 3 档（bond=0.90 chemistry=0.30）"),
+            "intimacy line carries the rung and both composites: {ctx}"
+        );
+        assert!(
+            ctx.contains("[耐心] 当前档位=高"),
+            "patience band line present: {ctx}"
+        );
+        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        let rung_at = ctx.find("[亲密度]").expect("intimacy line present");
+        let patience_at = ctx.find("[耐心]").expect("patience line present");
+        let signal_at = ctx.find("[信号]").expect("signal block present");
+        assert!(
+            rel_at < rung_at && rung_at < patience_at && patience_at < signal_at,
+            "buckets sit between [关系状态] and [信号]: {ctx}"
+        );
+    }
+
+    /// The rendered buckets follow the affinity, rather than being pinned to one
+    /// value. The rung's own cuts belong to the core crate — the composites are
+    /// a `/3` fold, so exact edge values are not reachable from here — but the
+    /// patience band reads a raw axis, so its edges render exactly.
+    #[test]
+    fn pde_ctx_bucket_lines_track_the_thresholds() {
+        let mut input = fixture_decision_input();
+        for (score, want) in [(0.05, 1), (0.5, 2), (0.95, 3)] {
+            input.affinity.warmth = score;
+            input.affinity.trust = score;
+            input.affinity.intrigue = score;
+            input.affinity.intimacy = 0.0;
+            input.affinity.tension = 0.0;
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            assert!(
+                ctx.contains(&format!("当前档位=第 {want} 档")),
+                "S={score} renders rung {want}: {ctx}"
+            );
+        }
+        for (patience, want) in [(0.349, "低"), (0.35, "中"), (0.649, "中"), (0.65, "高")] {
+            input.affinity.patience = patience;
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            assert!(
+                ctx.contains(&format!("[耐心] 当前档位={want}")),
+                "patience={patience} renders {want}: {ctx}"
+            );
+        }
+    }
+
+    /// Unconditional: a brand-new session renders 第 1 档 rather than omitting
+    /// the line, so an absent line can never be read as the bottom rung.
+    #[test]
+    fn pde_ctx_renders_bucket_lines_for_a_fresh_session() {
+        let mut input = fixture_decision_input();
+        // migration-0029 seed: every axis at 0.033.
+        input.affinity.warmth = 0.033;
+        input.affinity.trust = 0.033;
+        input.affinity.intrigue = 0.033;
+        input.affinity.intimacy = 0.033;
+        input.affinity.tension = 0.033;
+        input.affinity.patience = 0.5;
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
+        assert!(
+            ctx.contains("[亲密度] 当前档位=第 1 档"),
+            "fresh session renders the bottom rung: {ctx}"
+        );
+        assert!(
+            ctx.contains("[耐心] 当前档位=中"),
+            "patience line renders too: {ctx}"
+        );
+    }
+
     #[test]
     fn pde_ctx_omits_persona_block_when_empty() {
         use eros_engine_core::types::{DecisionInput, Event};
@@ -11560,6 +11618,7 @@ data: [DONE]\n\n";
             retry_depth: 2,
             reasoning: None,
             structured_output: true,
+            sampling: Default::default(),
         }
     }
 
@@ -11596,6 +11655,99 @@ data: [DONE]\n\n";
         assert_eq!(run.status, PdeStatus::Ok);
         assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
         assert_eq!(run.model.as_deref(), Some("model-b"));
+    }
+
+    #[tokio::test]
+    async fn pde_request_puts_configured_sampling_on_the_wire() {
+        // Issue #246 end-to-end lock. ChatRequest derives Default and every
+        // call-site literal ends in `..Default::default()`, so a site that
+        // forgets `sampling` still COMPILES and silently sends nothing — the
+        // compiler cannot catch this class. Assert the outbound body instead.
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
+                "id": "g", "model": "m"
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let mut p = test_resolved_pde(vec!["model-a".into()]);
+        p.sampling = eros_engine_llm::model_config::Sampling {
+            top_p: Some(0.55),
+            frequency_penalty: Some(0.35),
+            presence_penalty: Some(0.15),
+            repetition_penalty: Some(1.25),
+        };
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::Ok);
+
+        let sent: serde_json::Value = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .first()
+            .expect("one request")
+            .body_json()
+            .expect("body is json");
+        assert_eq!(sent["top_p"], 0.55);
+        assert_eq!(sent["frequency_penalty"], 0.35);
+        assert_eq!(sent["presence_penalty"], 0.15);
+        assert_eq!(sent["repetition_penalty"], 1.25);
+    }
+
+    #[tokio::test]
+    async fn pde_unset_sampling_stays_off_the_wire() {
+        // The other half of the contract: an untuned task must produce a
+        // byte-identical body to before #246 — no key, not a default value.
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
+                "id": "g", "model": "m"
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into()]);
+        assert_eq!(
+            run_pde_decision(&client, &p, "ctx").await.status,
+            PdeStatus::Ok
+        );
+
+        let sent: serde_json::Value = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .first()
+            .expect("one request")
+            .body_json()
+            .expect("body is json");
+        for k in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            assert!(
+                sent.get(k).is_none(),
+                "unset {k} must not reach the wire: {sent}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12677,6 +12829,7 @@ data: [DONE]\n\n"
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
             reasoning: None,
+            sampling: Default::default(),
         };
 
         let req = eros_engine_llm::openrouter::ChatRequest {
@@ -12921,6 +13074,7 @@ data: [DONE]\n\n"
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
             reasoning: None,
+            sampling: Default::default(),
         };
 
         let req = eros_engine_llm::openrouter::ChatRequest {
