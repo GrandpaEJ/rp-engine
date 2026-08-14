@@ -9,6 +9,7 @@ use eros_engine_core::affinity::{
     grade_turn, Affinity, AffinityDeltas, AffinityTuning, AxisGrades, PendingDeltas,
     RelationshipLabel,
 };
+use eros_engine_core::scope::AffinityScope;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -278,6 +279,7 @@ impl<'a> AffinityRepo<'a> {
         grades: &AxisGrades,
         rule_deltas: &AffinityDeltas,
         boost: f64,
+        scope: &AffinityScope,
         tuning: &AffinityTuning,
         event_type: &str,
         context: serde_json::Value,
@@ -313,7 +315,15 @@ impl<'a> AffinityRepo<'a> {
             tension: current.tension,
         };
 
-        let outcome = grade_turn(&current, grades, rule_deltas, &pending, boost, tuning);
+        let outcome = grade_turn(
+            &current,
+            grades,
+            rule_deltas,
+            &pending,
+            boost,
+            scope,
+            tuning,
+        );
         current.apply_deltas(&outcome.committed);
 
         // patience is judge-owned as an ABSOLUTE this turn: overwrite with the
@@ -370,10 +380,34 @@ impl<'a> AffinityRepo<'a> {
 
         // The audit trail keeps the judge's verdict verbatim and the gate's
         // new balance next to whatever context the caller supplied.
-        let mut context = context;
+        //
+        // `grades` stays the judge's originals; `effective_grades` is what the
+        // 3.1 scope ladder actually converted. Both are written whenever they
+        // differ, so a committed 0 stays attributable — the judge said nothing,
+        // or the ladder filtered it. Without the pair, evaluator-drift watching
+        // (the reason `grades` is logged at all) reads the engine's own
+        // corrections as model movement.
+        // The engine owns these keys, so they are written unconditionally — a
+        // caller that supplied a non-object context (this is a published crate;
+        // the caller is not necessarily us) keeps its value under `caller`
+        // rather than silently costing the turn its audit trail.
+        let mut context = match context {
+            v @ serde_json::Value::Object(_) => v,
+            serde_json::Value::Null => serde_json::json!({}),
+            other => serde_json::json!({ "caller": other }),
+        };
         if let Some(obj) = context.as_object_mut() {
             if let Ok(g) = serde_json::to_value(grades) {
                 obj.insert("grades".into(), g);
+            }
+            obj.insert("scope_mode".into(), outcome.scope_mode.as_key().into());
+            // Removed first, so a caller-supplied key can never leave an
+            // unsteered turn looking corrected.
+            obj.remove("effective_grades");
+            if outcome.effective_grades != *grades {
+                if let Ok(g) = serde_json::to_value(outcome.effective_grades) {
+                    obj.insert("effective_grades".into(), g);
+                }
             }
             if let Ok(p) = serde_json::to_value(outcome.pending) {
                 obj.insert("pending_after".into(), p);
@@ -459,6 +493,7 @@ mod tests {
             &AxisGrades::default(),
             &rule,
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
@@ -575,6 +610,182 @@ mod tests {
             .is_none());
     }
 
+    /// A committed 0 must stay attributable. With the 3.1 ladder engaged the
+    /// event row carries BOTH the judge's grades and the grades actually
+    /// converted, plus the mode that did it — otherwise evaluator-drift
+    /// watching reads the engine's own corrections as model movement.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_context_separates_judge_grades_from_effective(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades {
+                trust: 2,
+                intimacy: 1, // laddered to 0
+                tension: 2,  // laddered to 1
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityScope::full(),
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ctx: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(ctx["scope_mode"], "suppress_chemistry");
+        assert_eq!(ctx["grades"]["intimacy"], 1, "judge's verdict, verbatim");
+        assert_eq!(ctx["effective_grades"]["intimacy"], 0, "ladder filtered it");
+        assert_eq!(ctx["effective_grades"]["tension"], 1, "ladder halved it");
+        assert_eq!(ctx["effective_grades"]["trust"], 2, "bond axes untouched");
+        // intimacy committed nothing and paid no penalty; tension landed a g1.
+        assert_eq!(a.intimacy, 0.0);
+        assert!((a.tension - 0.05).abs() < 1e-9);
+    }
+
+    /// Unsteered turns must not grow an `effective_grades` key — it is written
+    /// only when the ladder actually changed something, so its presence alone
+    /// flags a corrected turn.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_context_omits_effective_grades_when_unsteered(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades {
+                intimacy: 1,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityScope::none(),
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ctx: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(ctx["scope_mode"], "neutral");
+        assert!(ctx.get("effective_grades").is_none());
+        assert!((a.intimacy - 0.05).abs() < 1e-9);
+    }
+
+    /// This is a published crate, so the caller is not necessarily us. A
+    /// non-object context must not cost the turn its audit trail, and a
+    /// caller-supplied `effective_grades` must never survive to make an
+    /// unsteered turn look corrected.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn engine_owned_audit_keys_survive_hostile_caller_context(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        async fn write(
+            pool: &PgPool,
+            user_id: Uuid,
+            instance_id: Uuid,
+            ctx: serde_json::Value,
+        ) -> serde_json::Value {
+            let repo = AffinityRepo { pool };
+            let session = make_session(pool, user_id, instance_id).await;
+            let mut a = repo
+                .load_or_create(session, user_id, instance_id)
+                .await
+                .unwrap();
+            repo.persist_with_event(
+                &mut a,
+                &AxisGrades {
+                    trust: 1,
+                    ..Default::default()
+                },
+                &AffinityDeltas::default(),
+                1.0,
+                &AffinityScope::none(),
+                &AffinityTuning::default(),
+                "message",
+                ctx,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+            )
+            .bind(a.id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        // A null context still gets the engine's keys.
+        let ctx = write(&pool, user_id, instance_id, serde_json::Value::Null).await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+
+        // A non-object context is preserved rather than dropped, and does not
+        // block the audit keys.
+        let ctx = write(
+            &pool,
+            user_id,
+            instance_id,
+            serde_json::json!("a bare string"),
+        )
+        .await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+        assert_eq!(ctx["caller"], "a bare string");
+
+        // A spoofed key is cleared: this turn was NOT steered.
+        let ctx = write(
+            &pool,
+            user_id,
+            instance_id,
+            serde_json::json!({ "effective_grades": { "tension": 9 } }),
+        )
+        .await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+        assert!(
+            ctx.get("effective_grades").is_none(),
+            "a caller must not be able to claim the ladder fired"
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn persist_with_event_updates_vector_and_logs(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
@@ -599,6 +810,7 @@ mod tests {
             },
             &AffinityDeltas::default(),
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({ "source": "test" }),
@@ -670,6 +882,7 @@ mod tests {
             },
             &AffinityDeltas::default(),
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
@@ -724,6 +937,7 @@ mod tests {
                 ..Default::default()
             },
             1.0,
+            &AffinityScope::none(),
             &tuning,
             "message",
             serde_json::json!({}),
@@ -753,6 +967,7 @@ mod tests {
                 ..Default::default()
             },
             1.0,
+            &AffinityScope::none(),
             &tuning,
             "message",
             serde_json::json!({}),
@@ -808,6 +1023,7 @@ mod tests {
                         ..Default::default()
                     },
                     1.0,
+                    &AffinityScope::none(),
                     &AffinityTuning {
                         delta_threshold: 0.5,
                         ..Default::default()
@@ -866,6 +1082,7 @@ mod tests {
                     ..Default::default()
                 },
                 1.0,
+                &AffinityScope::none(),
                 &tuning,
                 "message",
                 serde_json::json!({}),
@@ -921,6 +1138,7 @@ mod tests {
             },
             &AffinityDeltas::default(),
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({ "affinity_reason": "他坦白了" }),
@@ -1032,6 +1250,7 @@ mod tests {
                 },
                 &AffinityDeltas::default(),
                 1.0,
+                &AffinityScope::none(),
                 &AffinityTuning::default(),
                 "message",
                 serde_json::json!({}),
@@ -1052,6 +1271,7 @@ mod tests {
                 },
                 &AffinityDeltas::default(),
                 1.0,
+                &AffinityScope::none(),
                 &AffinityTuning::default(),
                 "message",
                 serde_json::json!({}),
@@ -1455,6 +1675,7 @@ mod tests {
                 ..Default::default()
             },
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
@@ -1620,6 +1841,7 @@ mod tests {
             },
             &AffinityDeltas::default(),
             1.0,
+            &AffinityScope::none(),
             &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
