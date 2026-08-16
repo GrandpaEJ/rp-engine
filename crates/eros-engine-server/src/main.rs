@@ -242,6 +242,14 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Same placement rationale as the affinity gate directly above: shape-
+    // independent, so a variant-shaped filter_prompt under
+    // [tasks.character_insight_structuring] gets the accurate "this prompt is
+    // engine-owned" message rather than the generic variant one.
+    if let Err(msg) = model_config.validate_structuring_prompt_unset() {
+        anyhow::bail!(msg);
+    }
+
     // Prompt-variant shape gate runs before the resolver-based checks below
     // (extraction / product_qa). Those detect "unset" via
     // `PromptSpec::as_plain()`, under which a variant shape (array/table)
@@ -487,6 +495,17 @@ mod tests {
             .expect("shipped example must not set an affinity filter_prompt");
     }
 
+    /// The shipped example's [tasks.character_insight_structuring] block is
+    /// parameters-only by design — it MUST pass the structuring dead-config
+    /// gate, or `main` bails on the config we tell people to copy.
+    #[test]
+    fn shipped_model_config_satisfies_structuring_prompt_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_structuring_prompt_unset()
+            .expect("shipped example must not set a structuring filter_prompt");
+    }
+
     /// Every `[tasks.*.tiers.*]` block in the shipped example is commented out
     /// (both `chat_companion`'s and `chat_output_filter`'s), so it MUST pass
     /// the tier dead-config gate, or `main` bails (#215).
@@ -549,6 +568,45 @@ mod tests {
             .validate_extraction_prompts()
             .expect_err("extraction gate also errors on this config, but for the wrong reason");
         assert!(unset_err.contains("unset"), "{unset_err}");
+    }
+
+    /// Ordering regression, sibling of the one above and the reason
+    /// `validate_structuring_prompt_unset` sits BEFORE `validate_prompt_variants`
+    /// in `main`. A variant-shaped `[tasks.character_insight_structuring]
+    /// .filter_prompt` trips both gates, so whichever runs first is the message
+    /// the operator actually sees. The structuring gate's is the actionable one:
+    /// it says the prompt is engine-owned and names the stage-1 key to edit
+    /// instead. The variant gate only reports that variants are unreadable here,
+    /// which would send an operator off to fix the shape of a key that must not
+    /// exist at all.
+    #[test]
+    fn variant_shaped_structuring_prompt_reports_the_actionable_error() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\n\
+             filter_prompt = { a = \"x\", b = \"y\" }\n",
+        )
+        .expect("parses");
+
+        let gate_err = cfg
+            .validate_structuring_prompt_unset()
+            .expect_err("a variant-shaped structuring prompt must refuse to boot");
+        assert!(gate_err.contains("engine-owned"), "{gate_err}");
+        assert!(
+            gate_err.contains("[tasks.character_insight_extraction].filter_prompt"),
+            "the message an operator sees must name the key that IS configurable: {gate_err}"
+        );
+
+        // Pins the masking this ordering prevents: the variant gate also errors
+        // on this config, but its message is about prompt SHAPE — advice for a
+        // key that should simply be deleted.
+        let variant_err = cfg
+            .validate_prompt_variants()
+            .expect_err("the variant gate also rejects this config, for a shallower reason");
+        assert!(
+            !variant_err.contains("engine-owned"),
+            "if the variant gate ever gained the actionable wording, this ordering \
+             test stops meaning anything: {variant_err}"
+        );
     }
 
     #[test]
