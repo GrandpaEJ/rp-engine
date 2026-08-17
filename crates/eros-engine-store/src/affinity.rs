@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use eros_engine_core::affinity::{
     grade_turn, Affinity, AffinityDeltas, AffinityTuning, AxisGrades, EndpointLevelReads,
-    PendingDeltas, RelationshipLabel,
+    PendingDeltas,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -33,7 +33,13 @@ pub struct AffinityRow {
     pub ghost_streak: i32,
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
-    pub relationship_label: Option<String>,
+    // `bond_tier` / `chem_tier` (migration 0049) are deliberately absent: this
+    // struct is populated by `SELECT *`, and sqlx's derived FromRow ignores
+    // columns it has no field for. Engine code always holds the score and
+    // derives the tier through `Affinity::bond_tier`; reading back its own
+    // projection would be a round-trip for nothing and would expose it to rows
+    // written by an older engine. Those columns exist for SQL consumers that
+    // cannot call Rust.
     /// Threshold-gate balance (migration 0043). NULL = all-zero.
     pub pending_deltas: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -58,7 +64,6 @@ impl AffinityRow {
             ghost_streak: self.ghost_streak,
             last_ghost_at: self.last_ghost_at,
             total_ghosts: self.total_ghosts,
-            relationship_label: self.relationship_label.as_deref().and_then(label_from_str),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -69,25 +74,36 @@ pub fn to_domain(row: AffinityRow) -> Affinity {
     row.into_domain()
 }
 
-fn label_from_str(s: &str) -> Option<RelationshipLabel> {
-    match s {
-        "stranger" => Some(RelationshipLabel::Stranger),
-        "romantic" => Some(RelationshipLabel::Romantic),
-        "friend" => Some(RelationshipLabel::Friend),
-        "frenemy" => Some(RelationshipLabel::Frenemy),
-        "slow_burn" => Some(RelationshipLabel::SlowBurn),
-        _ => None,
-    }
-}
-
-fn label_to_str(label: RelationshipLabel) -> &'static str {
-    match label {
-        RelationshipLabel::Stranger => "stranger",
-        RelationshipLabel::Romantic => "romantic",
-        RelationshipLabel::Friend => "friend",
-        RelationshipLabel::Frenemy => "frenemy",
-        RelationshipLabel::SlowBurn => "slow_burn",
-    }
+/// Point-in-time snapshot written to `companion_affinity_events.state_before` /
+/// `state_after` (migration 0049). Carries the derived values (`bond`,
+/// `chemistry`, both tiers) alongside the axes on purpose: an audit row is
+/// immutable and must record what the tier WAS under the thresholds in force at
+/// the time, which a later re-derivation cannot reproduce once they move.
+///
+/// `updated_at` and the ghost counters are in here for the same reason. A ghost
+/// moves no axis, so without them its two snapshots would be identical and
+/// would read as "nothing happened" — while the operation has in fact reset the
+/// decay clock, which silently forgives however much absence had accrued. An
+/// audit row that asserts no change across a real change is worse than one that
+/// says nothing, so the fields that did move are recorded.
+fn state_snapshot(a: &Affinity) -> serde_json::Value {
+    serde_json::json!({
+        "warmth": a.warmth,
+        "trust": a.trust,
+        "intrigue": a.intrigue,
+        "intimacy": a.intimacy,
+        "patience": a.patience,
+        "tension": a.tension,
+        "bond": a.bond_score(),
+        "chemistry": a.chemistry_score(),
+        "bond_tier": a.bond_tier(),
+        "chem_tier": a.chem_tier(),
+        "warmth_grade": a.warmth_grade,
+        "patience_grade": a.patience_grade,
+        "ghost_streak": a.ghost_streak,
+        "total_ghosts": a.total_ghosts,
+        "updated_at": a.updated_at,
+    })
 }
 
 /// One affinity event row joined to its session. `id` is the stable,
@@ -100,6 +116,10 @@ pub struct AffinityEventRow {
     pub effective_deltas: Option<serde_json::Value>, // committed (NULL pre-0014)
     pub label_changes: Option<serde_json::Value>,    // per-turn tier transition (NULL = none)
     pub effective_line_deltas: Option<serde_json::Value>, // exact {bond,chemistry} per-turn delta (NULL pre-migration)
+    /// Post-decay/pre-delta state (migration 0049). NULL on pre-4.1 rows.
+    pub state_before: Option<serde_json::Value>,
+    /// Post-turn state (migration 0049). NULL on pre-4.1 rows.
+    pub state_after: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -179,7 +199,7 @@ impl<'a> AffinityRepo<'a> {
         event_type: Option<&str>,
     ) -> Result<Vec<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -204,7 +224,7 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
     ) -> Result<Option<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -344,9 +364,6 @@ impl<'a> AffinityRepo<'a> {
         }
         current.refresh_endpoints(tuning);
 
-        let label = current.legacy_relationship_label();
-        current.relationship_label = Some(label);
-
         let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
             .and_then(|c| serde_json::to_value(&c).ok());
 
@@ -368,13 +385,17 @@ impl<'a> AffinityRepo<'a> {
             tension: current.tension - before.tension,
         };
 
-        sqlx::query(
+        // The tier columns are the engine's own result projected for SQL
+        // consumers — written here, never read back (see `AffinityRow`).
+        let (returned_updated_at,): (chrono::DateTime<Utc>,) = sqlx::query_as(
             "UPDATE engine.companion_affinity \
              SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
                  patience = $6, tension = $7, \
                  warmth_grade = $8, patience_grade = $9, \
-                 relationship_label = $10, pending_deltas = $11, updated_at = now() \
-             WHERE id = $1",
+                 bond_tier = $10, chem_tier = $11, \
+                 pending_deltas = $12, updated_at = now() \
+             WHERE id = $1 \
+             RETURNING updated_at",
         )
         .bind(current.id)
         .bind(current.warmth)
@@ -385,10 +406,15 @@ impl<'a> AffinityRepo<'a> {
         .bind(current.tension)
         .bind(current.warmth_grade)
         .bind(current.patience_grade)
-        .bind(label_to_str(label))
+        .bind(i16::from(current.bond_tier()))
+        .bind(i16::from(current.chem_tier()))
         .bind(serde_json::to_value(outcome.pending).ok())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        // The row's own `now()`, not `apply_deltas`' Rust-side one: the
+        // snapshot's `updated_at` is the decay baseline a replay measures the
+        // next gap from, so it has to be the value the table actually holds.
+        current.updated_at = returned_updated_at;
 
         // The audit trail keeps the judge's verdict verbatim and the gate's
         // new balance next to whatever context the caller supplied.
@@ -456,11 +482,15 @@ impl<'a> AffinityRepo<'a> {
 
         let deltas_json = serde_json::to_value(&outcome.raw).unwrap_or_default();
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
+        // `before_affinity` is post-decay/pre-delta, so within a row
+        // `state_after − state_before == effective_deltas`, and the gap to the
+        // PREVIOUS row's `state_after` is the absence effect applied above —
+        // which used to appear nowhere in the log (migration 0049).
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
-                model, usage, generation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                state_before, state_after, model, usage, generation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(current.id)
         .bind(event_type)
@@ -469,6 +499,8 @@ impl<'a> AffinityRepo<'a> {
         .bind(label_changes)
         .bind(effective_line_deltas)
         .bind(context)
+        .bind(state_snapshot(&before_affinity))
+        .bind(state_snapshot(&current))
         .bind(meta.and_then(|m| m.model.clone()))
         .bind(meta.and_then(|m| m.usage.clone()))
         .bind(meta.and_then(|m| m.generation_id.clone()))
@@ -483,37 +515,67 @@ impl<'a> AffinityRepo<'a> {
     }
 
     /// Increment ghost counters and stamp `last_ghost_at`. No deltas applied.
+    ///
+    /// Row-locked like [`Self::persist_with_event`], and for the same two
+    /// reasons. First, the counters are read-modify-write: incrementing from
+    /// the caller's possibly-stale in-memory value loses one of two concurrent
+    /// ghosts, so the increment happens in SQL against the locked row. Second,
+    /// callers hand us an `Affinity` they have already decayed and refreshed
+    /// IN MEMORY (the stream path does exactly that at turn start) without
+    /// writing those axes back — snapshotting that copy would put values in the
+    /// audit row that never existed in the table, and the next turn, reading
+    /// the row under lock, would show the relationship jumping back up with no
+    /// event to explain it. Both snapshots come off the row.
     pub async fn record_ghost(&self, affinity: &mut Affinity) -> Result<(), sqlx::Error> {
-        affinity.ghost_streak += 1;
-        affinity.total_ghosts += 1;
-        affinity.last_ghost_at = Some(Utc::now());
+        let mut tx = self.pool.begin().await?;
 
-        sqlx::query(
-            "UPDATE engine.companion_affinity \
-             SET ghost_streak = $2, total_ghosts = $3, \
-                 last_ghost_at = $4, updated_at = now() \
-             WHERE id = $1",
+        let before = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity WHERE id = $1 FOR UPDATE",
         )
         .bind(affinity.id)
-        .bind(affinity.ghost_streak)
-        .bind(affinity.total_ghosts)
-        .bind(affinity.last_ghost_at)
-        .execute(self.pool)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await?
+        .into_domain();
+
+        let after = sqlx::query_as::<_, AffinityRow>(
+            "UPDATE engine.companion_affinity \
+             SET ghost_streak = ghost_streak + 1, total_ghosts = total_ghosts + 1, \
+                 last_ghost_at = now(), updated_at = now() \
+             WHERE id = $1 \
+             RETURNING *",
+        )
+        .bind(affinity.id)
+        .fetch_one(&mut *tx)
+        .await?
+        .into_domain();
 
         let zero = serde_json::to_value(AffinityDeltas::default()).unwrap_or_default();
         let zero_line = serde_json::json!({ "bond": 0.0, "chemistry": 0.0 });
+        // No axis moves, so the two snapshots agree on every axis — they differ
+        // on the counters and on `updated_at`, which is the point: the reset
+        // decay clock is the one thing a ghost actually changes about future
+        // state, and it must not be invisible in the log.
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, context) \
-             VALUES ($1, 'ghost', '{}'::jsonb, $2, $3, '{}'::jsonb)",
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, context, \
+                state_before, state_after) \
+             VALUES ($1, 'ghost', '{}'::jsonb, $2, $3, '{}'::jsonb, $4, $5)",
         )
         .bind(affinity.id)
         .bind(zero)
         .bind(zero_line)
-        .execute(self.pool)
+        .bind(state_snapshot(&before))
+        .bind(state_snapshot(&after))
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
+
+        // Reflect the persisted state back to the caller, same contract as
+        // `persist_with_event`. Leaving the caller holding decayed axes and a
+        // stale `updated_at` while the row holds neither is how a later
+        // `persist_with_event` on the same struct would double-count decay.
+        *affinity = after;
         Ok(())
     }
 }
@@ -1362,7 +1424,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn persist_with_event_flips_label_when_axes_cross_thresholds(pool: PgPool) {
+    async fn persist_with_event_moves_tier_when_axes_cross_thresholds(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -1385,10 +1447,9 @@ mod tests {
         )
         .await;
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.relationship_label,
-            Some(RelationshipLabel::Romantic)
-        );
+        // chemistry = (0.5 + 0.3) / 2 = 0.4 → tier 3.
+        assert_eq!(reloaded.chem_tier(), 3);
+        assert_eq!(stored_tiers(&pool, session_id).await, (1, 3));
     }
 
     async fn seed_event(
@@ -1648,6 +1709,214 @@ mod tests {
         );
     }
 
+    /// Read back the tier columns the engine wrote (they are write-only from
+    /// the engine's side, so nothing else surfaces them).
+    async fn stored_tiers(pool: &PgPool, session_id: Uuid) -> (i16, i16) {
+        sqlx::query_as::<_, (i16, i16)>(
+            "SELECT bond_tier, chem_tier FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The persisted tier is taken from the POST-delta state, at every boundary
+    /// and on both sides of it, and survives the i16 round-trip to the column.
+    ///
+    /// It does NOT prove the ladder is single-sourced — both sides of the assert
+    /// run the same `tier_index` at the same commit, so moving a threshold moves
+    /// them together. That property is structural (one implementation exists),
+    /// not test-enforced. The genuine two-implementation risk is the migration's
+    /// inlined backfill `CASE`, which
+    /// `migration_backfill_case_matches_tier_index` covers.
+    ///
+    /// The two lines are given DIFFERENT scores so a bond/chem mix-up in the
+    /// UPDATE's bind order cannot pass.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stored_tier_matches_core_at_every_boundary(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        for score in [
+            0.0, 0.149999, 0.15, 0.349999, 0.35, 0.619999, 0.62, 0.899999, 0.90, 1.0,
+        ] {
+            let user_id = Uuid::new_v4();
+            let instance_id = seed_persona_instance(&pool, user_id).await;
+            let session_id = make_session(&pool, user_id, instance_id).await;
+            let mut a = repo
+                .load_or_create(session_id, user_id, instance_id)
+                .await
+                .unwrap();
+            // bond = (trust + intrigue) / 2, so both axes at `score` put the
+            // bond line exactly on `score`. Chemistry is deliberately parked one
+            // tier away (0.0 unless bond is already at the bottom) so the two
+            // columns are distinguishable.
+            let chem = if score < 0.15 { 0.95 } else { 0.0 };
+            persist_rule(
+                &repo,
+                &mut a,
+                AffinityDeltas {
+                    trust: score,
+                    intrigue: score,
+                    intimacy: chem,
+                    tension: chem,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            let reloaded = repo.load(session_id).await.unwrap().unwrap();
+            let (bond_tier, chem_tier) = stored_tiers(&pool, session_id).await;
+            assert_eq!(
+                bond_tier,
+                i16::from(reloaded.bond_tier()),
+                "bond_tier column disagrees with tier_index at score {score}"
+            );
+            assert_eq!(
+                chem_tier,
+                i16::from(reloaded.chem_tier()),
+                "chem_tier column disagrees with tier_index at score {score}"
+            );
+        }
+    }
+
+    /// The one place the tier thresholds genuinely exist twice: `tier_index` in
+    /// Rust, and the inlined `CASE` in migration 0049's backfill. Run the
+    /// migration's own expression against the boundary set and demand it agree.
+    /// Moving a threshold in Rust without touching the backfill fails here.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_backfill_case_matches_tier_index(pool: PgPool) {
+        let backfill = "SELECT CASE WHEN $1 < 0.15 THEN 1 WHEN $1 < 0.35 THEN 2 \
+                               WHEN $1 < 0.62 THEN 3 WHEN $1 < 0.90 THEN 4 \
+                               ELSE 5 END";
+        for score in [
+            0.0, 0.149999, 0.15, 0.349999, 0.35, 0.619999, 0.62, 0.899999, 0.90, 1.0,
+        ] {
+            let from_sql: i32 = sqlx::query_scalar(backfill)
+                .bind(score)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let from_rust = i32::from(eros_engine_core::affinity::tier_index(score));
+            assert_eq!(
+                from_sql, from_rust,
+                "migration backfill disagrees with tier_index at {score}"
+            );
+        }
+    }
+
+    /// The replay chain across a real absence gap — the case that makes
+    /// `state_before` worth storing at all.
+    ///
+    /// Also the regression guard for ghost snapshots: `record_ghost` must
+    /// record the ROW, never the caller's in-memory copy. Stream callers decay
+    /// and refresh their `Affinity` in memory at turn start without writing it
+    /// back, so snapshotting that copy would write an audit row that contradicts
+    /// the table and make the relationship appear to rebound on the next turn.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn absence_gap_and_ghost_snapshots_stay_on_the_row(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.5,
+                intrigue: 0.5,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Backdate the row, then hand `record_ghost` a copy decayed in memory
+        // exactly the way the stream path does it.
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET updated_at = now() - interval '30 days' WHERE id = $1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut in_memory = repo.load(session_id).await.unwrap().unwrap();
+        in_memory.apply_time_decay();
+        in_memory.refresh_endpoints(&AffinityTuning::default());
+        let decayed_intrigue = in_memory.intrigue;
+        let row_intrigue: f64 =
+            sqlx::query_scalar("SELECT intrigue FROM engine.companion_affinity WHERE id = $1")
+                .bind(a.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            decayed_intrigue < row_intrigue,
+            "precondition: 30 days must cool the in-memory copy below the row"
+        );
+
+        repo.record_ghost(&mut in_memory).await.unwrap();
+
+        let (before, after): (serde_json::Value, serde_json::Value) = sqlx::query_as(
+            "SELECT state_before, state_after FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1 AND event_type = 'ghost'",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let axis = |v: &serde_json::Value, k: &str| v.get(k).unwrap().as_f64().unwrap();
+        for k in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            assert_eq!(
+                axis(&before, k),
+                axis(&after, k),
+                "a ghost moves no axis ({k})"
+            );
+        }
+        // …but it DOES reset the decay clock, and that must not be invisible:
+        // two identical snapshots would assert "nothing happened" across the
+        // one thing a ghost actually changes about future state.
+        assert_ne!(
+            before.get("updated_at"),
+            after.get("updated_at"),
+            "the reset decay clock must be visible in the log"
+        );
+        assert_eq!(
+            before.get("ghost_streak").unwrap().as_i64().unwrap() + 1,
+            after.get("ghost_streak").unwrap().as_i64().unwrap()
+        );
+        let snap_intrigue = axis(&after, "intrigue");
+        assert!(
+            (snap_intrigue - row_intrigue).abs() < 1e-9,
+            "ghost snapshot must record the row ({row_intrigue}), \
+             not the caller's decayed copy ({decayed_intrigue}); got {snap_intrigue}"
+        );
+    }
+
+    /// A row that has never been through `persist_with_event` still reads as
+    /// tier 1 — the column DEFAULT is derived from an all-zero fresh row, not
+    /// picked.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fresh_row_defaults_to_bottom_tier(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_tiers(&pool, session_id).await, (1, 1));
+        assert_eq!(a.bond_tier(), 1);
+        assert_eq!(a.chem_tier(), 1);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn generated_bond_chemistry_match_core(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
@@ -1682,7 +1951,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn persist_writes_new_legacy_label(pool: PgPool) {
+    async fn persist_writes_tier_columns(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -1703,10 +1972,10 @@ mod tests {
         )
         .await;
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.relationship_label,
-            Some(RelationshipLabel::Romantic)
-        );
+        // chemistry = (0.9 + 0.9) / 2 = 0.9 → tier 5.
+        assert_eq!(reloaded.chem_tier(), 5);
+        // The columns are a projection of exactly that, never re-derived in SQL.
+        assert_eq!(stored_tiers(&pool, session_id).await, (1, 5));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1944,5 +2213,106 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("gen-aff"));
         assert_eq!(row.1.as_deref(), Some("aff/m"));
         assert_eq!(row.2, Some(serde_json::json!({"total_tokens": 9})));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_state_snapshots_close_the_replay_chain(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        for trust in [0.4_f64, 0.3_f64] {
+            persist_rule(
+                &repo,
+                &mut a,
+                AffinityDeltas {
+                    trust,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let rows: Vec<(serde_json::Value, serde_json::Value, serde_json::Value)> = sqlx::query_as(
+            "SELECT state_before, state_after, effective_deltas \
+             FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(a.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let axis = |v: &serde_json::Value, k: &str| v.get(k).unwrap().as_f64().unwrap();
+
+        for (before, after, effective) in &rows {
+            // Within a row the snapshots bracket exactly the delta application.
+            for k in [
+                "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+            ] {
+                assert!(
+                    (axis(after, k) - axis(before, k) - axis(effective, k)).abs() < 1e-9,
+                    "state_after - state_before must equal effective_deltas on {k}"
+                );
+            }
+            // The snapshot records the derived values as they stood, so a
+            // replay never has to re-derive them under later thresholds.
+            assert!(
+                (axis(after, "bond") - (axis(after, "trust") + axis(after, "intrigue")) / 2.0)
+                    .abs()
+                    < 1e-9
+            );
+            assert!(after.get("bond_tier").is_some());
+            assert!(after.get("chem_tier").is_some());
+            assert!(after.get("warmth_grade").is_some());
+        }
+
+        // Consecutive turns with no elapsed gap chain exactly: the second
+        // turn's baseline IS the first turn's result. Where a gap exists this
+        // difference is the absence effect, which previously appeared nowhere.
+        for k in ["trust", "intrigue", "intimacy", "tension"] {
+            assert!(
+                (axis(&rows[0].1, k) - axis(&rows[1].0, k)).abs() < 1e-9,
+                "previous state_after must be the next state_before on {k}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ghost_event_writes_equal_state_snapshots(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        repo.record_ghost(&mut a).await.unwrap();
+
+        let (before, after): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT state_before, state_after FROM engine.companion_affinity_events \
+                 WHERE affinity_id = $1 AND event_type = 'ghost'",
+            )
+            .bind(a.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // No axis moves, but both are written — a NULL here would put a hole
+        // back in the chain.
+        let (before, after) = (before.expect("state_before"), after.expect("state_after"));
+        for k in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            assert_eq!(before.get(k), after.get(k), "a ghost moves no axis ({k})");
+        }
+        assert_ne!(before.get("total_ghosts"), after.get("total_ghosts"));
     }
 }
