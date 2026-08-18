@@ -12,6 +12,7 @@ pub mod insight;
 pub mod memory;
 pub mod persona;
 pub mod pool;
+pub mod session_archive;
 pub mod story;
 pub mod world;
 pub mod world_town;
@@ -609,5 +610,28 @@ mod migration_tests {
                 .unwrap();
             assert_eq!(n, 2, "{table} must have both jsonb columns");
         }
+    }
+
+    /// 0052. The column is the entire storage surface of session soft-delete:
+    /// `false` is "visible", and an operator reviving a session sets it back
+    /// with a plain UPDATE. Pinned here because a NULLable or defaultless
+    /// column would make every pre-existing session invisible on deploy.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0052_chat_sessions_archived_column(pool: PgPool) {
+        let (is_nullable, column_default): (String, Option<String>) = sqlx::query_as(
+            "SELECT is_nullable, column_default FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'chat_sessions' \
+               AND column_name = 'archived'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("chat_sessions.archived must exist");
+
+        assert_eq!(is_nullable, "NO", "archived must be NOT NULL");
+        assert_eq!(
+            column_default.as_deref(),
+            Some("false"),
+            "archived must default to false so existing sessions stay visible"
+        );
     }
 }
