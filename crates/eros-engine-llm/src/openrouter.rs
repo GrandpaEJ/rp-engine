@@ -21,11 +21,11 @@ const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Max gap between SSE *bytes* before a live stream is declared dead.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Marker prefix of the idle-watchdog error message. Pub so the pipeline's
-/// stream-metrics outcome mapping can recognize an idle timeout after the
-/// message has been stringified through the SSE layer's `Transport error:`
-/// wrapper into `LlmError::Stream` (issue #188 — spec §4.2 lists
-/// `"idle_timeout"` as its own outcome, distinct from `"chunk_error"`).
+/// Marker prefix of the idle-watchdog error message. Pub so failure
+/// classification can recognize an idle timeout after the message has been
+/// stringified through the SSE layer's `Transport error:` wrapper into
+/// `LlmError::Stream` (issue #188 — `GatewayKind::IdleTimeout` stays distinct
+/// from `GatewayKind::Transport`).
 pub const STREAM_IDLE_TIMEOUT_MSG: &str = "openrouter stream idle timeout";
 
 /// Gap-bound a fallible stream: an idle period longer than `idle` between
@@ -193,64 +193,154 @@ fn body_preview(s: &str) -> String {
     }
 }
 
-/// Turn a raw provider error body into a bounded, redacted one-line string safe
-/// for ordinary logs. Best-effort parses the OpenRouter
-/// `{"error":{code,message,metadata}}` envelope and keeps only `code`
-/// (as `serde_json::Value` — codes are sometimes strings, not ints), a
+/// `Retry-After` as whole seconds. The delta-seconds form is honoured; the
+/// HTTP-date form returns `None` rather than being resolved against a clock —
+/// the engine does not act on this value, it only records and forwards it.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u32> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// A provider error body, parsed into parts instead of flattened to a string.
+///
+/// `Display` reproduces exactly what `scrub_error_body` used to return, so every
+/// log line and every existing assertion is byte-identical; the named fields are
+/// what the audit columns read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedErrorBody {
+    /// OpenRouter `error.code` (numeric) or Venice `error.code` (string),
+    /// rendered as its JSON text so a numeric `529` and a string
+    /// `"MODEL_OVERLOADED"` stay distinguishable.
+    pub code: Option<String>,
+    /// OpenRouter `metadata.error_type`, or the OpenAI-compatible `error.type`.
+    pub error_type: Option<String>,
+    /// OpenRouter `metadata.provider_code` — the provider's own upstream code.
+    pub provider_code: Option<String>,
+    /// Bounded, single-line, prompt-free.
+    pub message: String,
+}
+
+impl ParsedErrorBody {
+    /// For call sites that have prose rather than an error envelope.
+    pub fn message_only(s: &str) -> Self {
+        Self {
+            message: s.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+impl std::fmt::Display for ParsedErrorBody {
+    /// `message` is already the fully assembled, bounded, single-line string
+    /// that `scrub_error_body` used to return — code and metadata are folded
+    /// into it by `parse_error_body`. The named fields are a parallel view for
+    /// the audit columns, not extra text to append here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Turn a raw provider error body into parts instead of flattening it to a
+/// string. Best-effort parses the OpenRouter `{"error":{code,message,metadata}}`
+/// envelope and keeps `code` (as `serde_json::Value` — codes are sometimes
+/// strings, not ints), `metadata.error_type` / `metadata.provider_code`, a
 /// length-capped `message`, and — from a moderation `metadata` block —
 /// `provider_name` + `reasons`. It deliberately DROPS `metadata.flagged_input`,
 /// which is an excerpt of the user's flagged prompt that a moderation rejection
-/// echoes back (logging it would leak raw chat content). Non-envelope bodies
-/// fall back to a plain length-capped preview.
+/// echoes back (logging it would leak raw chat content). Also handles Venice's
+/// two shapes: the OpenAI-compatible envelope (semantic name in string `code`,
+/// family in `type`, no `metadata`) and the bare `{"error": "..."}` string form.
+/// Non-envelope bodies fall back to a plain length-capped preview.
 ///
-/// `pub(crate)`: the voyage client reuses this for its own status-error
-/// bodies (issue #188) — the envelope parse simply falls through to the
-/// capped preview for non-OpenRouter shapes.
-pub(crate) fn scrub_error_body(raw: &str) -> String {
+/// `pub`: `ParsedErrorBody` sits in `LlmError`, a `pub` type, so this must be
+/// too. The voyage and embeddings clients also reuse it for their own
+/// status-error bodies (issue #188) — the envelope parse simply falls through
+/// to the capped preview for non-OpenRouter shapes.
+pub fn parse_error_body(raw: &str) -> ParsedErrorBody {
     #[derive(Deserialize)]
     struct Env {
-        error: ErrBody,
+        error: ErrField,
     }
+    // Venice returns either a bare string or an object under `error`.
     #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ErrField {
+        Text(String),
+        Body(Box<ErrBody>),
+    }
+    #[derive(Deserialize, Default)]
     struct ErrBody {
         #[serde(default)]
         code: Option<serde_json::Value>,
         #[serde(default)]
         message: Option<String>,
+        /// OpenAI-compatible family name (Venice). OpenRouter puts its
+        /// equivalent under `metadata.error_type`, read below.
+        #[serde(default, rename = "type")]
+        ty: Option<String>,
         #[serde(default)]
         metadata: Option<serde_json::Value>,
     }
+
     let Ok(env) = serde_json::from_str::<Env>(raw) else {
-        return body_preview(raw);
+        return ParsedErrorBody {
+            message: body_preview(raw),
+            ..Default::default()
+        };
     };
-    let code = env
-        .error
-        .code
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".into());
-    // Assemble the raw parts, then run the WHOLE string through body_preview
-    // once. provider_name / reasons are provider-controlled and could carry
-    // newlines or be arbitrarily long, so the single final flatten+cap is what
-    // upholds the "bounded, single-line" guarantee for every field — not just
-    // the message.
+    let body = match env.error {
+        ErrField::Text(t) => ErrBody {
+            message: Some(t),
+            ..Default::default()
+        },
+        ErrField::Body(b) => *b,
+    };
+
+    let code = body.code.map(|c| c.to_string());
+    let meta = body.metadata.as_ref();
+    let meta_str = |key: &str| -> Option<String> {
+        meta.and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let error_type = meta_str("error_type").or(body.ty);
+    let provider_code = meta_str("provider_code");
+
+    // Assemble the human-readable parts, then run the WHOLE string through
+    // body_preview once. provider_name / reasons are provider-controlled and
+    // could carry newlines or be arbitrarily long, so the single final
+    // flatten+cap is what upholds the "bounded, single-line" guarantee for
+    // every field — not just the message. flagged_input is never read: it is
+    // the user's own prompt excerpt and must not reach a log or an audit row.
     let mut out = format!(
-        "code={code}: {}",
-        env.error.message.as_deref().unwrap_or("")
+        "code={}: {}",
+        code.as_deref().unwrap_or("?"),
+        body.message.as_deref().unwrap_or("")
     );
-    // Provider identity + moderation reasons are safe to surface; flagged_input
-    // (the user's prompt excerpt) is never read.
-    if let Some(meta) = env.error.metadata.as_ref() {
-        if let Some(provider) = meta.get("provider_name").and_then(|v| v.as_str()) {
-            out.push_str(&format!(" [provider={provider}]"));
-        }
-        if let Some(reasons) = meta.get("reasons").and_then(|v| v.as_array()) {
-            let rs: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
-            if !rs.is_empty() {
-                out.push_str(&format!(" [moderation_reasons={}]", rs.join(",")));
-            }
+    if let Some(p) = meta_str("provider_name") {
+        out.push_str(&format!(" [provider={p}]"));
+    }
+    if let Some(reasons) = meta
+        .and_then(|m| m.get("reasons"))
+        .and_then(|v| v.as_array())
+    {
+        let joined: Vec<&str> = reasons.iter().filter_map(|r| r.as_str()).collect();
+        if !joined.is_empty() {
+            out.push_str(&format!(" [moderation_reasons={}]", joined.join(",")));
         }
     }
-    body_preview(&out)
+
+    ParsedErrorBody {
+        code,
+        error_type,
+        provider_code,
+        message: body_preview(&out),
+    }
 }
 
 /// A 200 body that failed to decode as a chat/vision completion: if it is in
@@ -264,12 +354,35 @@ fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
         .and_then(|v| v.get("error").cloned())
         .is_some();
     if is_api_error {
-        LlmError::Provider(format!(
+        LlmError::Provider(ParsedErrorBody::message_only(&format!(
             "openrouter 200 error body: {}",
-            scrub_error_body(body)
-        ))
+            parse_error_body(body)
+        )))
     } else {
         LlmError::Decode(err)
+    }
+}
+
+/// Build the `ParsedErrorBody` for a mid-stream provider error frame (a
+/// top-level `error` object on an otherwise-200 SSE stream). The `"mid-stream
+/// error: "` marker is the only thing that distinguishes this from a 200-body
+/// error envelope caught by `decode_or_api_error` — nothing was sent there,
+/// whereas here the provider started streaming and then failed, so partial
+/// content may already be out. Both classify as `Provider` errors at
+/// `http_status: 200`, so without the marker nothing tells them apart. No
+/// vendor name in the marker: this client also serves Venice and any custom
+/// OpenAI-compatible endpoint via the `@provider` suffix, and `"openrouter
+/// ..."` on a Venice stream would simply be false.
+fn mid_stream_error_body(code: Option<&serde_json::Value>, message: &str) -> ParsedErrorBody {
+    let code = code.map(|c| c.to_string());
+    ParsedErrorBody {
+        code: code.clone(),
+        message: body_preview(&format!(
+            "mid-stream error: code={}: {}",
+            code.as_deref().unwrap_or("?"),
+            message
+        )),
+        ..Default::default()
     }
 }
 
@@ -288,6 +401,11 @@ pub struct ChatResponse {
     /// Present as `"content_filter"` when Gemini/OpenAI mid-response
     /// safety truncation fires; callers can gate on this value.
     pub finish_reason: Option<String>,
+    /// Every hop that failed before the served one. Populated on success too:
+    /// a turn that recovered on the second model still has to report what the
+    /// first one said, which used to leave no trace anywhere.
+    #[serde(default)]
+    pub failures: Vec<crate::failure::AttemptFailure>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -686,9 +804,10 @@ impl OpenRouterClient {
             ));
         }
 
-        let mut last_err: Option<LlmError> = None;
+        let mut failures: Vec<crate::failure::AttemptFailure> = Vec::new();
+        let task = req.task.as_deref().unwrap_or("");
         // Latest recoverable byte-BPE garble seen while walking the chain, kept
-        // separately from `last_err` so a LATER non-garble failure (transport /
+        // separately from `failures` so a LATER non-garble failure (transport /
         // status / decode) can't discard a repairable earlier garble. Tuple:
         // (model, raw, finish_reason).
         let mut last_garbled: Option<(String, String, Option<String>)> = None;
@@ -709,7 +828,10 @@ impl OpenRouterClient {
                 )
                 .await
             {
-                Ok(resp) => return Ok(resp),
+                Ok(mut resp) => {
+                    resp.failures = failures;
+                    return Ok(resp);
+                }
                 Err(e) => {
                     if let LlmError::Garbled {
                         model,
@@ -724,6 +846,14 @@ impl OpenRouterClient {
                             last_garbled =
                                 Some((model.clone(), raw.clone(), finish_reason.clone()));
                         }
+                    }
+                    // A garble is a content verdict — the call succeeded and
+                    // was billed — so it belongs to the caller's coarse marker
+                    // and to NEITHER column (spec §2).
+                    if crate::failure::AttemptFailure::should_record(&e) {
+                        failures.push(crate::failure::AttemptFailure::from_llm_error(
+                            task, model, &e,
+                        ));
                     }
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
@@ -750,7 +880,6 @@ impl OpenRouterClient {
                             "{msg}"
                         );
                     }
-                    last_err = Some(e);
                 }
             }
         }
@@ -772,9 +901,10 @@ impl OpenRouterClient {
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
                 // downstream validity gates still see the safety signal.
                 finish_reason,
+                failures: failures.clone(),
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
+        Err(LlmError::Chain { failures })
     }
 
     /// Execute a one-shot vision describe, walking the candidate chain
@@ -791,7 +921,10 @@ impl OpenRouterClient {
                 "openrouter: vision has no models configured".into(),
             ));
         }
-        let mut last_err: Option<LlmError> = None;
+        let mut failures: Vec<crate::failure::AttemptFailure> = Vec::new();
+        // `VisionRequest` carries no `task` field (see `VISION_TASK` above) —
+        // the vision pre-stage is single-purpose, so its task name is fixed.
+        let task = VISION_TASK;
         // Latest recoverable garble, kept separate so a later non-garble failure
         // can't discard a repairable earlier garble (mirrors `execute`). Tuple:
         // (model, raw, finish_reason).
@@ -801,7 +934,9 @@ impl OpenRouterClient {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (endpoint); next");
-                    last_err = Some(e);
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
@@ -838,22 +973,32 @@ impl OpenRouterClient {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
-                    last_err = Some(e.into());
+                    let e: LlmError = e.into();
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
             let status = resp.status();
             if !status.is_success() {
+                let retry_after = retry_after_secs(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
-                last_err = Some(LlmError::Status(status, scrub_error_body(&text)));
+                let e = LlmError::Status(status, parse_error_body(&text), retry_after);
+                failures.push(crate::failure::AttemptFailure::from_llm_error(
+                    task, model, &e,
+                ));
                 continue;
             }
             let body = match resp.text().await {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
-                    last_err = Some(e.into());
+                    let e: LlmError = e.into();
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
@@ -862,7 +1007,9 @@ impl OpenRouterClient {
                 Err(e) => {
                     let err = decode_or_api_error(&body, e);
                     tracing::warn!(model = %model, error = %err, "openrouter: vision attempt failed (decode); next");
-                    last_err = Some(err);
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &err,
+                    ));
                     continue;
                 }
             };
@@ -874,16 +1021,13 @@ impl OpenRouterClient {
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
+                // Nothing is pushed: a garble is a content verdict, the call
+                // succeeded and was billed, and neither column owns it
+                // (spec §2 — the rule is `AttemptFailure::should_record`).
                 // Retain only a COMPLETE garble for last-resort salvage; a
-                // length-truncated garble is incomplete, so route it to last_err
-                // (the caller fails open) rather than salvaging partial JSON.
-                if finish_reason.as_deref() == Some("length") {
-                    last_err = Some(LlmError::Garbled {
-                        model: model.to_string(),
-                        raw,
-                        finish_reason,
-                    });
-                } else {
+                // length-truncated garble is incomplete, so repairing it would
+                // hand partial JSON to the caller as if it were whole.
+                if finish_reason.as_deref() != Some("length") {
                     last_garbled = Some((model.to_string(), raw, finish_reason));
                 }
                 continue;
@@ -906,6 +1050,7 @@ impl OpenRouterClient {
                 model: model_out,
                 usage: parsed.usage,
                 finish_reason,
+                failures,
             });
         }
         // Exhausted with no clean describe. If any candidate returned recoverable
@@ -925,9 +1070,10 @@ impl OpenRouterClient {
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
                 // run_vision's validity gate still sees the safety signal.
                 finish_reason,
+                failures: failures.clone(),
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
+        Err(LlmError::Chain { failures })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -990,8 +1136,13 @@ impl OpenRouterClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, scrub_error_body(&text)));
+            return Err(LlmError::Status(
+                status,
+                parse_error_body(&text),
+                retry_after,
+            ));
         }
 
         // Read as text so a 200 body that is actually an error envelope
@@ -1013,9 +1164,9 @@ impl OpenRouterClient {
         // Fail the attempt so `execute`'s chain advances rather than returning a
         // partial reply that callers' validity gates would accept as complete.
         if finish_reason.as_deref() == Some("error") {
-            return Err(LlmError::Provider(
-                "openrouter: non-stream completion finished with finish_reason=error".into(),
-            ));
+            return Err(LlmError::Provider(ParsedErrorBody::message_only(
+                "openrouter: non-stream completion finished with finish_reason=error",
+            )));
         }
         if crate::byte_bpe::looks_byte_garbled(&raw) {
             tracing::error!(
@@ -1047,6 +1198,7 @@ impl OpenRouterClient {
             model: model_out,
             usage: parsed.usage,
             finish_reason,
+            failures: Vec::new(),
         })
     }
 
@@ -1134,8 +1286,13 @@ impl OpenRouterClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, scrub_error_body(&text)));
+            return Err(LlmError::Status(
+                status,
+                parse_error_body(&text),
+                retry_after,
+            ));
         }
 
         // Observability: connect+headers latency and the negotiated HTTP
@@ -1184,20 +1341,21 @@ impl OpenRouterClient {
                                 // all-None chunk that lets a partial reply
                                 // persist as a clean success.
                                 if let Some(err) = frame.error {
-                                    // body_preview: err.message is provider-
-                                    // controlled — keep the logged error bounded
-                                    // and single-line like every other body.
-                                    return Some(Err(LlmError::Provider(format!(
-                                        "openrouter mid-stream error: code={:?}: {}",
-                                        err.code,
-                                        body_preview(&err.message)
+                                    // The provider spoke inside a 200 stream.
+                                    // Keep the code structured — this used to
+                                    // be format!("code={:?}") into a String,
+                                    // which destroyed it.
+                                    return Some(Err(LlmError::Provider(mid_stream_error_body(
+                                        err.code.as_ref(),
+                                        &err.message,
                                     ))));
                                 }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
                                 if choice.finish_reason.as_deref() == Some("error") {
                                     return Some(Err(LlmError::Provider(
-                                        "openrouter stream terminated with finish_reason=error"
-                                            .into(),
+                                        ParsedErrorBody::message_only(
+                                            "openrouter stream terminated with finish_reason=error",
+                                        ),
                                     )));
                                 }
                                 Some(Ok(DeltaChunk {
@@ -1787,10 +1945,106 @@ mod tests {
             })
             .await
             .expect_err("all fail");
-        assert!(
-            matches!(err, LlmError::Status(s, _) if s.as_u16() == 500),
-            "expected last 500, got {err:?}"
-        );
+        match err {
+            LlmError::Chain { failures } => {
+                let last = failures.last().expect("at least one failure");
+                match last {
+                    crate::failure::AttemptFailure::Upstream(a) => {
+                        assert_eq!(a.http_status, 500, "expected last 500, got {a:?}")
+                    }
+                    other => panic!("expected Upstream, got {other:?}"),
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_reports_the_failed_hop_even_when_a_fallback_recovers() {
+        // The whole point: a turn that recovered used to leave no trace at all.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_string_contains("primary/m"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(529)
+                    .set_body_string(r#"{"error":{"code":529,"message":"Overloaded"}}"#),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::body_string_contains("fallback/m"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"hi"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url("k".into(), server.uri());
+        let resp = client
+            .execute(ChatRequest {
+                model: "primary/m".into(),
+                fallback_model: vec!["fallback/m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fallback should recover");
+
+        assert_eq!(resp.reply, "hi");
+        assert_eq!(resp.failures.len(), 1, "the 529 hop must be reported");
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => {
+                assert_eq!(a.http_status, 529);
+                assert_eq!(a.model, "primary/m");
+                assert_eq!(a.task, "chat_companion");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_returns_chain_error_carrying_every_hop() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":503,"message":"no provider"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url("k".into(), server.uri());
+        let err = client
+            .execute(ChatRequest {
+                model: "a/m".into(),
+                fallback_model: vec!["b/m".into(), "c/m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("all candidates fail");
+
+        match err {
+            LlmError::Chain { failures } => {
+                assert_eq!(failures.len(), 3, "one entry per hop");
+                for f in &failures {
+                    match f {
+                        crate::failure::AttemptFailure::Upstream(a) => {
+                            assert_eq!(a.http_status, 503)
+                        }
+                        other => panic!("expected Upstream, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     // ─── B-err1: bounded + redacted provider error body ─────────────────────
@@ -1824,7 +2078,7 @@ mod tests {
             }
         })
         .to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(
             !out.contains("SECRET USER PROMPT TEXT"),
             "flagged_input leaked: {out}"
@@ -1853,7 +2107,7 @@ mod tests {
             }
         })
         .to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(!out.contains('\n'), "must be single-line: {out:?}");
         assert!(
             out.chars().count() <= ERROR_PREVIEW_MAX + 1,
@@ -1866,16 +2120,149 @@ mod tests {
     fn scrub_error_body_handles_numeric_code_and_non_envelope() {
         // Numeric code (Value, not i64-restricted) round-trips.
         let raw = serde_json::json!({"error": {"code": 402, "message": "no credits"}}).to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(out.contains("code=402"), "{out}");
         assert!(out.contains("no credits"), "{out}");
         // Non-envelope junk falls back to a bounded preview.
         let junk: String = "boom ".repeat(100);
-        let out = scrub_error_body(&junk);
+        let out = parse_error_body(&junk).to_string();
         assert!(
             out.chars().count() <= ERROR_PREVIEW_MAX + 1,
             "bounded: {}",
             out.len()
+        );
+    }
+
+    #[test]
+    fn parse_error_body_extracts_openrouter_metadata_fields() {
+        // error_type and metadata.provider_code were never extracted before —
+        // scrub_error_body read only code / message / provider_name / reasons.
+        let raw = serde_json::json!({
+            "error": {
+                "code": 529,
+                "message": "Overloaded",
+                "metadata": {
+                    "error_type": "overloaded",
+                    "provider_code": "anthropic:overloaded_error"
+                }
+            }
+        })
+        .to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code.as_deref(), Some("529"));
+        assert_eq!(p.error_type.as_deref(), Some("overloaded"));
+        assert_eq!(
+            p.provider_code.as_deref(),
+            Some("anthropic:overloaded_error")
+        );
+    }
+
+    #[test]
+    fn parse_error_body_reads_venice_openai_compatible_shape() {
+        // Venice's OpenAI-compatible envelope puts the semantic name in `code`
+        // (a string) and the family in `type`. No `metadata` at all.
+        let raw = serde_json::json!({
+            "error": {
+                "message": "The model is currently overloaded",
+                "type": "rate_limit_error",
+                "param": null,
+                "code": "MODEL_OVERLOADED"
+            }
+        })
+        .to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code.as_deref(), Some("\"MODEL_OVERLOADED\""));
+        assert_eq!(p.error_type.as_deref(), Some("rate_limit_error"));
+        assert!(p.message.contains("overloaded"), "{}", p.message);
+    }
+
+    #[test]
+    fn parse_error_body_reads_venice_bare_string_shape() {
+        let raw = serde_json::json!({ "error": "Authentication failed" }).to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code, None);
+        assert!(p.message.contains("Authentication failed"), "{}", p.message);
+    }
+
+    #[test]
+    fn parse_error_body_display_matches_legacy_scrub_output() {
+        // The Display impl is what every existing log line and assertion sees.
+        let raw = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "flagged",
+                "metadata": {
+                    "reasons": ["sexual"],
+                    "flagged_input": "SECRET USER PROMPT TEXT",
+                    "provider_name": "SomeProvider"
+                }
+            }
+        })
+        .to_string();
+        let out = parse_error_body(&raw).to_string();
+        assert!(!out.contains("SECRET USER PROMPT TEXT"), "leaked: {out}");
+        assert!(out.contains("code=\"moderation\""), "{out}");
+        assert!(out.contains("provider=SomeProvider"), "{out}");
+        assert!(out.contains("moderation_reasons=sexual"), "{out}");
+    }
+
+    #[test]
+    fn parse_error_body_message_only_keeps_the_text_and_no_code() {
+        let p = ParsedErrorBody::message_only("stream terminated with finish_reason=error");
+        assert_eq!(p.code, None);
+        assert_eq!(p.error_type, None);
+        assert_eq!(p.provider_code, None);
+        assert_eq!(p.message, "stream terminated with finish_reason=error");
+    }
+
+    #[test]
+    fn mid_stream_error_message_keeps_a_marker_and_the_code() {
+        // The marker is the only thing separating "the provider died mid-stream,
+        // partial content may already be out" from "the provider returned an error
+        // envelope with a 200 and nothing was sent" — both are Provider errors that
+        // classify as upstream at http_status 200.
+        let body = mid_stream_error_body(Some(&serde_json::json!(529)), "Overloaded");
+        assert_eq!(body.to_string(), "mid-stream error: code=529: Overloaded");
+    }
+
+    #[test]
+    fn mid_stream_error_message_with_no_code() {
+        let body = mid_stream_error_body(None, "provider blew up");
+        assert_eq!(
+            body.to_string(),
+            "mid-stream error: code=?: provider blew up"
+        );
+    }
+
+    #[test]
+    fn parse_error_body_display_is_byte_identical_to_the_legacy_format() {
+        // scrub_error_body's output shape is an operator-facing log format. The
+        // three inherited tests use .contains(), which cannot see a dropped
+        // bracket — this one pins the whole string.
+        let raw = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "slow down",
+                "metadata": { "provider_name": "SomeProvider", "reasons": ["sexual", "violence"] }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            parse_error_body(&raw).to_string(),
+            "code=429: slow down [provider=SomeProvider] [moderation_reasons=sexual,violence]"
+        );
+    }
+
+    #[test]
+    fn parse_error_body_drops_non_string_moderation_reasons() {
+        let raw = serde_json::json!({
+            "error": { "code": 403, "message": "no", "metadata": { "reasons": [{"x": 1}] } }
+        })
+        .to_string();
+        let out = parse_error_body(&raw).to_string();
+        assert_eq!(
+            out, "code=403: no",
+            "a non-string reason contributes nothing"
         );
     }
 
@@ -1887,7 +2274,7 @@ mod tests {
             serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
         let err = serde_json::from_str::<WireResponse>(&body).expect_err("no choices");
         match decode_or_api_error(&body, err) {
-            LlmError::Provider(msg) => assert!(msg.contains("bad request"), "{msg}"),
+            LlmError::Provider(msg) => assert!(msg.to_string().contains("bad request"), "{msg}"),
             other => panic!("expected Provider, got {other:?}"),
         }
         // Genuine junk stays a Decode error (no body leak — Display is a serde offset).
@@ -1932,7 +2319,13 @@ mod tests {
             })
             .await
             .expect_err("403 fails the chain");
-        let shown = err.to_string();
+        let shown = match &err {
+            LlmError::Chain { failures } => match failures.last() {
+                Some(crate::failure::AttemptFailure::Upstream(a)) => a.message.clone(),
+                other => panic!("expected Upstream, got {other:?}"),
+            },
+            other => panic!("expected Chain, got {other:?}"),
+        };
         assert!(
             !shown.contains("RAW USER CHAT"),
             "flagged_input leaked into error: {shown}"
@@ -2015,10 +2408,19 @@ mod tests {
             })
             .await
             .expect_err("a 200 error envelope must fail, not decode-silently");
-        assert!(
-            matches!(&err, LlmError::Provider(m) if m.contains("provider exploded")),
-            "expected Provider with the embedded message, got {err:?}"
-        );
+        match err {
+            LlmError::Chain { failures } => match failures.last() {
+                Some(crate::failure::AttemptFailure::Upstream(a)) => {
+                    assert_eq!(a.http_status, 200, "mid-stream error rides a 200: {a:?}");
+                    assert!(
+                        a.message.contains("provider exploded"),
+                        "expected the embedded message, got {a:?}"
+                    );
+                }
+                other => panic!("expected Upstream, got {other:?}"),
+            },
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2256,7 +2658,7 @@ data: [DONE]\n\n";
             .await
             .expect_err("4xx → Err before any stream yielded");
         assert!(
-            matches!(err, LlmError::Status(s, _) if s.as_u16() == 429),
+            matches!(err, LlmError::Status(s, _, _) if s.as_u16() == 429),
             "expected Status(429), got {err:?}"
         );
     }
@@ -2473,7 +2875,7 @@ data: [DONE]\n\n";
         match second {
             Err(LlmError::Provider(msg)) => {
                 assert!(
-                    msg.contains("provider disconnected"),
+                    msg.to_string().contains("provider disconnected"),
                     "error message carries the upstream detail: {msg}"
                 );
             }
@@ -3000,6 +3402,15 @@ data: [DONE]\n\n";
         assert_eq!(resp.reply, "hi there");
         // The served model field comes from the fallback wire response.
         assert_eq!(resp.model.as_deref(), Some("f1"));
+        // Spec §2: the garbled hop's call SUCCEEDED and was billed, so it is a
+        // content verdict owned by the caller's coarse marker. It must not
+        // appear in either column — least of all as a `decode` gateway error,
+        // which would say our path to the provider broke when it did not.
+        assert!(
+            resp.failures.is_empty(),
+            "a garble belongs to neither column: {:?}",
+            resp.failures
+        );
     }
 
     #[tokio::test]
@@ -3177,10 +3588,17 @@ data: [DONE]\n\n";
             })
             .await
             .expect_err("length-truncated garble must NOT be salvaged");
-        assert!(
-            matches!(err, LlmError::Garbled { .. }),
-            "expected the Garbled error to surface (caller fails open), got {err:?}"
-        );
+        match err {
+            // The chain still dies — the caller fails open on the `Err`. What
+            // the garble does NOT do is land in a column: the call succeeded
+            // and was billed, so it is a content verdict owned by the caller's
+            // coarse marker (spec §2, `AttemptFailure::should_record`).
+            LlmError::Chain { failures } => assert!(
+                failures.is_empty(),
+                "a garble belongs to neither column: {failures:?}"
+            ),
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3231,6 +3649,177 @@ data: [DONE]\n\n";
             "no generation_id when repaired"
         );
         assert_eq!(resp.model.as_deref(), Some("vp"));
+    }
+
+    #[tokio::test]
+    async fn execute_vision_reports_the_failed_hop_even_when_a_fallback_recovers() {
+        // Vision variant of execute_reports_the_failed_hop_even_when_a_fallback_recovers.
+        // execute_vision has its own (non-call_once) control flow, so this must be
+        // exercised separately, not just inferred from the chat test. 502 (not
+        // chat's 529) so a copy-paste that accidentally hit the chat path fails
+        // loudly instead of passing silently.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vision-primary/m"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_string(r#"{"error":{"code":502,"message":"Bad Gateway"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vision-fallback/m"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"description\":\"a cat\"}" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vision-primary/m".into(),
+                fallback_model: vec!["vision-fallback/m".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect("fallback should recover");
+
+        assert_eq!(resp.reply, "{\"description\":\"a cat\"}");
+        assert_eq!(resp.failures.len(), 1, "the 502 hop must be reported");
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => {
+                assert_eq!(a.http_status, 502);
+                assert_eq!(a.model, "vision-primary/m");
+                assert_eq!(a.task, VISION_TASK);
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_vision_returns_chain_error_carrying_every_hop() {
+        // Vision variant of execute_returns_chain_error_carrying_every_hop.
+        // Vision-shaped model slugs (va/vb/vc, not chat's a/b/c) so a copy-paste
+        // that mixed up the two chains would show up in the failed model name.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":503,"message":"no provider"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute_vision(VisionRequest {
+                model: "va/m".into(),
+                fallback_model: vec!["vb/m".into(), "vc/m".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect_err("all candidates fail");
+
+        match err {
+            LlmError::Chain { failures } => {
+                assert_eq!(failures.len(), 3, "one entry per hop");
+                for f in &failures {
+                    match f {
+                        crate::failure::AttemptFailure::Upstream(a) => {
+                            assert_eq!(a.http_status, 503)
+                        }
+                        other => panic!("expected Upstream, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_vision_salvage_return_carries_the_failures_too() {
+        // Mirrors execute_returns_repaired_garble_even_when_later_candidate_fails:
+        // primary "vp" returns recoverable garble, fallback "vf1" then fails with a
+        // non-garble status error. The salvage must still return vp's repaired text
+        // AND report vf1's hop in `failures` — this exercises the
+        // `failures: failures.clone()` on execute_vision's salvage return, which
+        // was previously verified only by reading the code.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vp"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vf1"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vp".into(),
+                fallback_model: vec!["vf1".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect("earlier garble salvaged despite later non-garble failure");
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert_eq!(resp.model.as_deref(), Some("vp"));
+        // vf1's 500 rides the salvage return; vp's garble does NOT — the call
+        // succeeded and was billed, so it is a content verdict and belongs to
+        // neither column (spec §2).
+        assert_eq!(
+            resp.failures.len(),
+            1,
+            "only the non-garble hop is recordable: {:?}",
+            resp.failures
+        );
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => assert_eq!(a.http_status, 500),
+            other => panic!("expected the 500 hop, got {other:?}"),
+        }
     }
 
     #[tokio::test]

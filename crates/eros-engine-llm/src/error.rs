@@ -9,7 +9,13 @@ pub enum LlmError {
     Http(#[from] reqwest::Error),
 
     #[error("non-success status {0}: {1}")]
-    Status(reqwest::StatusCode, String),
+    Status(
+        reqwest::StatusCode,
+        crate::openrouter::ParsedErrorBody,
+        /// `Retry-After` in seconds, when the provider sent one. Recorded and
+        /// passed downstream; the engine never acts on it.
+        Option<u32>,
+    ),
 
     #[error("response decode error: {0}")]
     Decode(#[from] serde_json::Error),
@@ -24,7 +30,7 @@ pub enum LlmError {
     Config(String),
 
     #[error("provider error: {0}")]
-    Provider(String),
+    Provider(crate::openrouter::ParsedErrorBody),
 
     /// Wraps a mid-stream parse failure (`data:` line that did not decode as
     /// an OpenRouter-compatible delta envelope). The string is the raw
@@ -47,6 +53,20 @@ pub enum LlmError {
         model: String,
         raw: String,
         finish_reason: Option<String>,
+    },
+
+    /// Every candidate in the chain failed. Carries the whole walk.
+    ///
+    /// Display renders the LAST failure alongside the count: a chain error is
+    /// what `tracing::warn!("...{e}")` prints at every call site in the server,
+    /// and a bare count would tell an operator nothing about why the turn died.
+    #[error(
+        "openrouter: all {} candidates failed; last: {}",
+        failures.len(),
+        failures.last().map(ToString::to_string).unwrap_or_else(|| "(none)".into())
+    )]
+    Chain {
+        failures: Vec<crate::failure::AttemptFailure>,
     },
 }
 
@@ -73,6 +93,44 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "openrouter: model thedrummer/cydonia-24b-v4.1 returned byte-BPE garbled output"
+        );
+    }
+
+    #[test]
+    fn chain_error_display_names_the_last_failure_not_just_the_count() {
+        // A chain error is what every server-side tracing::warn!("...{e}")
+        // prints. A bare count tells an operator nothing about why the turn
+        // died.
+        use crate::failure::{AttemptFailure, UpstreamAttempt};
+        let e = LlmError::Chain {
+            failures: vec![
+                AttemptFailure::Upstream(UpstreamAttempt {
+                    task: "chat_companion".into(),
+                    model: "a/m".into(),
+                    http_status: 503,
+                    provider_code: None,
+                    error_type: None,
+                    upstream_provider_code: None,
+                    retry_after_s: None,
+                    message: "code=503: no provider".into(),
+                }),
+                AttemptFailure::Upstream(UpstreamAttempt {
+                    task: "chat_companion".into(),
+                    model: "b/m".into(),
+                    http_status: 529,
+                    provider_code: None,
+                    error_type: None,
+                    upstream_provider_code: None,
+                    retry_after_s: None,
+                    message: "code=529: Overloaded".into(),
+                }),
+            ],
+        };
+        let s = e.to_string();
+        assert!(s.contains('2'), "must carry the attempt count: {s}");
+        assert!(
+            s.contains("code=529: Overloaded"),
+            "must carry the LAST failure, not the first: {s}"
         );
     }
 }

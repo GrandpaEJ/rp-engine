@@ -133,45 +133,48 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (grades, levels, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
-            let persona_repo = PersonaRepo { pool: &state.pool };
-            let affinity_repo = AffinityRepo { pool: &state.pool };
-            let persona_name = match persona_repo.load_companion(instance_id).await {
-                Ok(Some(p)) => p.genome.name,
-                _ => String::new(),
-            };
-            // Snapshot the current vector for prompt context only; the
-            // authoritative value is re-read under lock in persist_with_event.
-            match affinity_repo.load(session_id).await {
-                Ok(Some(current)) if !persona_name.is_empty() => {
-                    evaluate_affinity(
-                        &state,
-                        session_id,
-                        &persona_name,
-                        &current,
-                        &user_msg,
-                        &eval_text,
-                        client_id.as_deref(),
-                    )
-                    .await
+        let (grades, levels, reason, affinity_meta, skip_reason, eval_failures) =
+            if pre_skip.is_none() {
+                let persona_repo = PersonaRepo { pool: &state.pool };
+                let affinity_repo = AffinityRepo { pool: &state.pool };
+                let persona_name = match persona_repo.load_companion(instance_id).await {
+                    Ok(Some(p)) => p.genome.name,
+                    _ => String::new(),
+                };
+                // Snapshot the current vector for prompt context only; the
+                // authoritative value is re-read under lock in persist_with_event.
+                match affinity_repo.load(session_id).await {
+                    Ok(Some(current)) if !persona_name.is_empty() => {
+                        evaluate_affinity(
+                            &state,
+                            session_id,
+                            &persona_name,
+                            &current,
+                            &user_msg,
+                            &eval_text,
+                            client_id.as_deref(),
+                        )
+                        .await
+                    }
+                    _ => (
+                        eros_engine_core::affinity::AxisGrades::default(),
+                        eros_engine_core::affinity::EndpointLevelReads::default(),
+                        String::new(),
+                        None,
+                        Some("no_persona_or_affinity"),
+                        Vec::new(),
+                    ),
                 }
-                _ => (
+            } else {
+                (
                     eros_engine_core::affinity::AxisGrades::default(),
                     eros_engine_core::affinity::EndpointLevelReads::default(),
                     String::new(),
                     None,
-                    Some("no_persona_or_affinity"),
-                ),
-            }
-        } else {
-            (
-                eros_engine_core::affinity::AxisGrades::default(),
-                eros_engine_core::affinity::EndpointLevelReads::default(),
-                String::new(),
-                None,
-                pre_skip,
-            )
-        };
+                    pre_skip,
+                    Vec::new(),
+                )
+            };
 
         // Grades, rule deltas and endpoint levels travel separately into the
         // store, which runs the 4.0 pipeline (convert → decay → penalty →
@@ -192,6 +195,7 @@ pub async fn run(
             context,
             affinity_meta,
             levels,
+            &eval_failures,
         )
         .await;
     };
@@ -238,6 +242,7 @@ async fn persist_affinity(
     context: serde_json::Value,
     meta: Option<eros_engine_store::OpenRouterCallMeta>,
     levels: eros_engine_core::affinity::EndpointLevelReads,
+    eval_failures: &[eros_engine_llm::failure::AttemptFailure],
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -291,6 +296,8 @@ async fn persist_affinity(
                 ActionType::Ghost => unreachable!(),
                 ActionType::ProductQa => unreachable!(),
             };
+            let (llm_attempts, gateway_errors) =
+                crate::pipeline::stream::split_failures(eval_failures);
             if let Err(e) = repo
                 .persist_with_event(
                     &mut affinity,
@@ -302,6 +309,8 @@ async fn persist_affinity(
                     context,
                     meta.as_ref(),
                     levels,
+                    llm_attempts,
+                    gateway_errors,
                 )
                 .await
             {
@@ -582,9 +591,10 @@ fn affinity_eval_text(
 /// passes and a call is attempted.
 ///
 /// The reasons here are the *pre-attempt* ones, mirroring the old `run_eval`
-/// gate exactly. Reasons only knowable after attempting
-/// (`no_persona_or_affinity`, `eval_error`, `eval_timeout`) are decided at the
-/// call site / in `evaluate_affinity`.
+/// gate exactly. `no_persona_or_affinity` — the one other genuine skip, decided
+/// only after loading — is stamped at the call site. A call that was made and
+/// FAILED is not a skip: it leaves no reason here and explains its NULL trio
+/// through `llm_attempts` / `gateway_errors` instead.
 fn eval_skip_reason(
     action: ActionType,
     user_msg_chars: usize,
@@ -630,9 +640,13 @@ fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'st
 }
 
 /// Build the affinity event `context` JSON: the model's `affinity_reason` when a
-/// successful eval produced one, and/or an `eval_skip_reason` marker when the
-/// audit trio has no usable join key. By construction a row with a NULL
-/// `generation_id` always gets a marker, so it is never silently unexplained.
+/// successful eval produced one, and/or an `eval_skip_reason` marker when no
+/// call was made (or a successful one came back without a join key).
+///
+/// The invariant: a row with a NULL `generation_id` is always explained —
+/// either by an `eval_skip_reason` (no call was attempted) or by a non-empty
+/// `llm_attempts` / `gateway_errors` (a call was attempted and failed). A
+/// failed call is not a skip, so it writes no marker here.
 fn build_affinity_context(reason: &str, skip_reason: Option<&str>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     if !reason.is_empty() {
@@ -676,12 +690,32 @@ fn affinity_eval_messages(
     ]
 }
 
+/// Grades, endpoint level reads, the model's reason, the audit trio, the skip
+/// marker, and every failed attempt — what one eval hands back to the caller.
+type AffinityEvalOutcome = (
+    eros_engine_core::affinity::AxisGrades,
+    eros_engine_core::affinity::EndpointLevelReads,
+    String,
+    Option<eros_engine_store::OpenRouterCallMeta>,
+    Option<&'static str>,
+    Vec<eros_engine_llm::failure::AttemptFailure>,
+);
+
 /// Run the haiku affinity evaluator for one Reply turn. Returns the signed
 /// judge grades, the snapped absolute patience read (`None` when the model
-/// omitted it), and the model's reason. Any failure (LLM error, non-JSON,
-/// malformed grades) yields all-zero grades + no patience read + empty reason
-/// so the rule deltas still persist and the affinity write never fails
-/// because the evaluator failed.
+/// omitted it), the model's reason, and — last — every failed attempt, for the
+/// event row's two audit columns. That list is populated on SUCCESS too: this
+/// is the one call site that hands `execute` the whole `[primary] + fallback`
+/// chain, so a primary that returned `529` before the fallback answered is
+/// recorded here or nowhere. Any failure (LLM error, non-JSON, malformed
+/// grades) yields all-zero grades + no patience read + empty reason so the rule
+/// deltas still persist and the affinity write never fails because the
+/// evaluator failed.
+///
+/// Those failures go to `companion_affinity_events` and nowhere else: the eval
+/// runs after the response is already out, is fail-open, and "no affinity
+/// judgment this turn" is a normal state a consumer cannot act on, so it is
+/// deliberately absent from the SSE `final` frame (spec §6.1).
 async fn evaluate_affinity(
     state: &AppState,
     session_id: Uuid,
@@ -690,16 +724,13 @@ async fn evaluate_affinity(
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
-) -> (
-    eros_engine_core::affinity::AxisGrades,
-    eros_engine_core::affinity::EndpointLevelReads,
-    String,
-    Option<eros_engine_store::OpenRouterCallMeta>,
-    Option<&'static str>,
-) {
+) -> AffinityEvalOutcome {
     use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
 
     let resolved = state.model_config.resolve(AFFINITY_TASK, None);
+    // Kept out of the request so a failure that never reached a model (a local
+    // timeout) still has a slug to name.
+    let model_for_audit = resolved.model.clone();
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
@@ -713,7 +744,7 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let (raw, meta) =
+    let (raw, meta, recovered) =
         match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
             Ok(Ok(resp)) => {
                 super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
@@ -722,16 +753,39 @@ async fn evaluate_affinity(
                     model: resp.model.clone(),
                     usage: resp.usage.clone(),
                 };
-                (resp.reply, Some(meta))
+                // Spec §5.4: `failures` is populated on success too. This is
+                // the ONLY call site that hands `execute` a real
+                // `[primary] + fallback` chain, so it is the only place a hop
+                // a fallback recovered from can be recorded at all — drop it
+                // here and a 529-then-success turn persists nothing.
+                (resp.reply, Some(meta), resp.failures)
             }
             Ok(Err(e)) => {
                 tracing::warn!("affinity eval LLM call failed: {e}");
+                // A call WAS made and failed, so there is no skip reason: the
+                // failure record is what explains the NULL trio.
+                //
+                // Unlike every other call site, this one hands `execute` the
+                // whole `[model] + fallback` chain instead of walking it
+                // itself, so a chain-exhausted error already carries EVERY
+                // hop — keep them all rather than just the last.
+                let failures = match &e {
+                    eros_engine_llm::LlmError::Chain { failures } if !failures.is_empty() => {
+                        failures.clone()
+                    }
+                    other => vec![eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                        AFFINITY_TASK,
+                        &model_for_audit,
+                        other,
+                    )],
+                };
                 return (
                     AxisGrades::default(),
                     EndpointLevelReads::default(),
                     String::new(),
                     None,
-                    Some("eval_error"),
+                    None,
+                    failures,
                 );
             }
             Err(_elapsed) => {
@@ -743,7 +797,18 @@ async fn evaluate_affinity(
                     EndpointLevelReads::default(),
                     String::new(),
                     None,
-                    Some("eval_timeout"),
+                    None,
+                    vec![eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: AFFINITY_TASK.into(),
+                            model: Some(model_for_audit),
+                            kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                            message: format!(
+                                "affinity eval timeout after {}s",
+                                AFFINITY_EVAL_TIMEOUT.as_secs()
+                            ),
+                        },
+                    )],
                 );
             }
         };
@@ -753,7 +818,7 @@ async fn evaluate_affinity(
     // Eval ran, but a salvaged response can still lack a generation_id — mark it
     // so a NULL audit join key is never left unexplained.
     let skip = meta.as_ref().and_then(meta_skip_reason);
-    (grades, levels, reason, meta, skip)
+    (grades, levels, reason, meta, skip, recovered)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -1649,17 +1714,22 @@ mod tests {
             build_affinity_context("他主动分享", None),
             serde_json::json!({ "affinity_reason": "他主动分享" })
         );
-        // Skipped/failed eval (NULL trio): marker only, always explainable.
+        // Skipped eval (NULL trio): marker only, always explainable.
         assert_eq!(
             build_affinity_context("", Some("short_user_msg")),
             serde_json::json!({ "eval_skip_reason": "short_user_msg" })
         );
-        // Empty reason + no skip → {} (only when an eval ran but returned no reason).
+        // Empty reason + no skip → {}. Two ways to get here now: an eval that
+        // ran and returned no reason, and an eval that FAILED — a failed call
+        // is not a skip, so its explanation lives in the failure columns.
         assert_eq!(build_affinity_context("", None), serde_json::json!({}));
         // Defensive: both present coexist.
         assert_eq!(
-            build_affinity_context("r", Some("eval_timeout")),
-            serde_json::json!({ "affinity_reason": "r", "eval_skip_reason": "eval_timeout" })
+            build_affinity_context("r", Some("eval_no_generation_id")),
+            serde_json::json!({
+                "affinity_reason": "r",
+                "eval_skip_reason": "eval_no_generation_id"
+            })
         );
     }
 
@@ -2172,6 +2242,267 @@ mod tests {
         );
     }
 
+    /// `eval_skip_reason` means "no call was attempted". A failed call is not a
+    /// skip, so `eval_error` / `eval_timeout` are retired outright with nothing
+    /// replacing them — the failure columns carry the explanation instead. The
+    /// restated invariant: a NULL `generation_id` is explained by a skip reason
+    /// OR by a non-empty `llm_attempts` / `gateway_errors`.
+    ///
+    /// A `reply_image` turn is the shape that reaches the eval gate without
+    /// dragging the memory and insight futures along: `produced` carries no
+    /// text (both of those skip on that alone) while `plan.image_caption`
+    /// stands in as the assistant-content proxy, so the eval still fires.
+    /// `526` is used by no other test in the suite.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn failed_affinity_eval_records_the_status_without_a_skip_reason(pool: sqlx::PgPool) {
+        use eros_engine_store::affinity::AffinityRepo;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(526)
+                    .set_body_string(r#"{"error":{"code":526,"message":"no provider"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The eval gate needs a loadable affinity row; `persist_with_event`
+        // would create one anyway, but the eval runs first.
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.affinity_evaluation]\nmodel=\"aff/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+
+        let event = Event::UserMessage {
+            content: "我今天过得还不错，你呢".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            history_anchor: Default::default(),
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyImage,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_tone: None,
+            image_caption: Some("在天台看夕阳".into()),
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: String::new(),
+            action: ActionType::ReplyImage,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            event,
+            plan,
+            produced,
+        )
+        .await;
+
+        let (context, attempts, generation_id): (
+            serde_json::Value,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT e.context, e.llm_attempts, e.generation_id \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 ORDER BY e.created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(generation_id.is_none());
+        assert!(
+            context.get("eval_skip_reason").is_none(),
+            "a failed call is not a skip: {context}"
+        );
+        let attempts = attempts.expect("the 526 explains the NULL generation_id");
+        assert_eq!(attempts[0]["http_status"], 526);
+        assert_eq!(attempts[0]["task"], AFFINITY_TASK);
+    }
+
+    /// Spec §1 goal 1 and §5.4: hops a fallback RECOVERED from are persisted
+    /// too. Affinity eval is the only call site that hands `execute` a real
+    /// `[primary] + fallback` chain, so it is the only place that promise can
+    /// be kept — drop `ChatResponse.failures` on the success path and a
+    /// 529-then-served eval leaves no trace anywhere in the tree.
+    ///
+    /// The eval SUCCEEDS here, so the row's audit trio is populated and there
+    /// is no skip reason: the two columns are pure recovered-hop evidence,
+    /// which is exactly the case a failure-only implementation misses.
+    ///
+    /// `521` is used by no other test in the suite.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_affinity_eval_records_the_hop_the_fallback_survived(pool: sqlx::PgPool) {
+        use eros_engine_store::affinity::AffinityRepo;
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("aff/primary"))
+            .respond_with(
+                ResponseTemplate::new(521)
+                    .set_body_string(r#"{"error":{"code":521,"message":"web server is down"}}"#),
+            )
+            .mount(&server)
+            .await;
+        let eval = r#"{"warmth":3,"trust":{"grade":1,"direction":"up"},"intimacy":{"grade":1,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":2,"reason":"稳"}"#;
+        Mock::given(body_string_contains("aff/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff-ok",
+                "model": "aff/fallback",
+                "choices": [{"message": {"content": eval}}],
+            })))
+            .mount(&server)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.affinity_evaluation]\nmodel=\"aff/primary\"\nfallback=[\"aff/fallback\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+
+        let event = Event::UserMessage {
+            content: "我今天过得还不错，你呢".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            history_anchor: Default::default(),
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyImage,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_tone: None,
+            image_caption: Some("在天台看夕阳".into()),
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: String::new(),
+            action: ActionType::ReplyImage,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            event,
+            plan,
+            produced,
+        )
+        .await;
+
+        let (context, attempts, gateways, generation_id): (
+            serde_json::Value,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT e.context, e.llm_attempts, e.gateway_errors, e.generation_id \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 ORDER BY e.created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            generation_id.as_deref(),
+            Some("gen-aff-ok"),
+            "the fallback served — this is a SUCCESSFUL eval"
+        );
+        assert!(
+            context.get("eval_skip_reason").is_none(),
+            "nothing was skipped: {context}"
+        );
+        let attempts = attempts.expect("the recovered 521 hop must be persisted");
+        assert_eq!(attempts[0]["http_status"], 521);
+        assert_eq!(attempts[0]["task"], AFFINITY_TASK);
+        assert_eq!(attempts[0]["model"], "aff/primary");
+        assert!(
+            gateways.is_none(),
+            "the provider spoke and the chain did its job: {gateways:?}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn persist_affinity_sets_levels_and_discards_rule_patience(pool: sqlx::PgPool) {
         use eros_engine_store::affinity::AffinityRepo;
@@ -2214,6 +2545,7 @@ mod tests {
                 warmth: None,
                 patience: Some(3),
             },
+            &[],
         )
         .await;
 
