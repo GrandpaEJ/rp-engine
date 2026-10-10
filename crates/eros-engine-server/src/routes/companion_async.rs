@@ -25,9 +25,8 @@ use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    build_user_row_metadata, persisted_content_role, resolve_quote, resolve_text_turn,
-    validate_image_capability, validate_payload, AffinityScopeDto, ImageReplyParams,
-    StreamPreErrorBody, StreamSendRequest,
+    build_user_row_metadata, resolve_quote, resolve_text_turn, validate_image_capability,
+    validate_payload, AffinityScopeDto, ImageReplyParams, StreamPreErrorBody, StreamSendRequest,
 };
 use crate::state::AppState;
 
@@ -46,8 +45,6 @@ pub(crate) struct QueuedTurnParams {
     pub prompt_traits: Option<Vec<PromptTraitDto>>,
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
-    #[serde(default)]
-    pub tips_amount_usd: Option<f64>,
     #[serde(default)]
     pub image_url: Option<String>,
     #[serde(default)]
@@ -166,7 +163,6 @@ pub async fn send_message_async(
     let chat_repo = ChatRepo { pool: &state.pool };
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
-    let (persisted_content, persisted_role) = persisted_content_role(&req);
 
     let params = serde_json::to_value(QueuedTurnParams {
         tier: req.tier.clone(),
@@ -174,7 +170,6 @@ pub async fn send_message_async(
         affinity_scope: req.affinity_scope,
         prompt_traits: req.prompt_traits,
         audit: req.audit,
-        tips_amount_usd: req.tips_amount_usd,
         image_url: req.image_url,
         image: req.image,
         reply_to_message_id: req.reply_to_message_id,
@@ -190,9 +185,9 @@ pub async fn send_message_async(
     let outcome = queue_repo
         .enqueue_user_message(
             session_id,
-            &persisted_content,
+            &req.content,
             &req.client_msg_id,
-            persisted_role,
+            "user",
             persisted_metadata.as_ref(),
             user_id,
             &params,
@@ -625,6 +620,7 @@ mod tests {
                 name: None,
                 quantity: None,
                 text: Some("捏了捏你的脸".into()),
+                amount_usd: None,
             }),
             ..Default::default()
         };
@@ -641,5 +637,23 @@ mod tests {
             legacy.action.is_none(),
             "rows queued before this field still parse"
         );
+    }
+
+    #[test]
+    fn queued_params_rebuild_a_tip() {
+        let params: super::QueuedTurnParams =
+            serde_json::from_value(json!({"action": {"type": "tip", "amount_usd": 20.0}})).unwrap();
+        assert_eq!(
+            params.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 }
+        );
+    }
+
+    #[test]
+    fn params_queued_with_a_stale_tip_still_parse() {
+        let params: super::QueuedTurnParams =
+            serde_json::from_value(json!({"tips_amount_usd": 20.0, "tier": "gold"})).unwrap();
+        assert_eq!(params.tier.as_deref(), Some("gold"));
+        assert!(params.action.is_none());
     }
 }

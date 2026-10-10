@@ -18,9 +18,8 @@
 //!   to the JWT user; otherwise 403 Forbidden.
 //! - All DB I/O routes through the `eros-engine-store` repos
 //!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `HumanInsightRepo`).
-//! - The credit ledger is gone in OSS — tipping is handled inline on the
-//!   streaming `/message/stream` path via `tips_amount_usd`, not through a
-//!   separate credit-spending endpoint.
+//! - The credit ledger is gone in OSS — a tip is a `tip` user action on the
+//!   send routes, not a separate credit-spending endpoint.
 //! - `/comp/user/{user_id}/profile` returns the flat, typed `human_insights`
 //!   row (city/occupation/interests/... — see `ProfileResponse`), not the
 //!   legacy freeform `companion_insights` JSON blob.
@@ -131,7 +130,7 @@ pub struct ChatHistoryEntry {
     /// to the first model of the turn ("delivered to a model", not that
     /// model's acknowledgement). **Omitted while unread**, so a client tests
     /// for the key's presence; there is no `null` form. Omitted forever on
-    /// tips and on voice `user` rows, which have no reader — treat absence as
+    /// voice `user` rows, which have no reader — treat absence as
     /// "no receipt", never as "not yet read".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
@@ -1072,8 +1071,7 @@ async fn archive_instance_sessions(
 /// about.
 ///
 /// Out of reach here: `user` rows, which carry the engine's own stamp (the
-/// moment the turn handed the message to its first model), and `gift_user`
-/// tips, which nobody reads on the user's behalf.
+/// moment the turn handed the message to its first model).
 ///
 /// Voice sessions are accepted, and so are their assistant rows — those are
 /// messages addressed to the human like any other, and only the ENGINE's writer
@@ -2420,7 +2418,7 @@ mod tests {
         let genome_id = seed_genome(&pool, "Nova").await;
         let instance_id = seed_instance(&pool, genome_id, user_id).await;
         let session_id = seed_session(&pool, user_id, instance_id).await;
-        for role in ["user", "gift_user", "assistant"] {
+        for role in ["user", "user", "assistant"] {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, 'x')",
             )

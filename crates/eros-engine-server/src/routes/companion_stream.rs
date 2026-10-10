@@ -36,7 +36,7 @@ use crate::state::AppState;
 const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
 const MAX_IMAGE_URL_LEN: usize = 2048;
-const MAX_TIP_USD: f64 = 1_000_000.0;
+const MAX_TIP_USD: f64 = 1_000_000_000.0;
 const MAX_ACTION_NAME_CHARS: usize = 32;
 const MAX_ACTION_TEXT_CHARS: usize = 100;
 const MAX_ACTION_QUANTITY: u32 = 99;
@@ -124,6 +124,7 @@ pub enum UserActionKind {
     Touch,
     Lick,
     Custom,
+    Tip,
 }
 
 /// What a `give` action hands over.
@@ -137,7 +138,8 @@ pub enum GiftItemDto {
 
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give` → bond, everything else → chemistry).
+/// the line the action touches (`give` → bond, every physical or custom action →
+/// chemistry); a refused `tip` costs nothing.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -158,6 +160,11 @@ pub struct UserActionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 100)]
     pub text: Option<String>,
+    /// `tip` only, and required there: the amount in USD, finite, in
+    /// `(0, 1_000_000_000]`. The engine records it and never verifies it; the
+    /// caller is the payment authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_usd: Option<f64>,
 }
 
 impl UserActionDto {
@@ -208,6 +215,17 @@ impl UserActionDto {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
             },
+            UserActionKind::Tip => {
+                let amount_usd = self
+                    .amount_usd
+                    .ok_or("action.amount_usd is required for tip")?;
+                if !amount_usd.is_finite() || amount_usd <= 0.0 || amount_usd > MAX_TIP_USD {
+                    return Err(format!(
+                        "action.amount_usd must be a finite value in (0, {MAX_TIP_USD}]"
+                    ));
+                }
+                UserAction::Tip { amount_usd }
+            }
         })
     }
 }
@@ -254,8 +272,6 @@ pub struct StreamSendRequest {
     #[serde(default)]
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
-    pub tips_amount_usd: Option<f64>,
-    #[serde(default)]
     pub image_url: Option<String>,
     #[serde(default)]
     pub image: Option<ImageReplyParams>,
@@ -279,8 +295,7 @@ pub struct StreamSendRequest {
     #[serde(default)]
     pub user_region: Option<String>,
     /// Optional action this turn carries besides the text (see
-    /// [`UserActionDto`]). With an action, `content` may be empty. Cannot be
-    /// combined with `tips_amount_usd`.
+    /// [`UserActionDto`]). With an action, `content` may be empty.
     #[serde(default)]
     pub action: Option<UserActionDto>,
     /// Bring-your-own-key configuration for this turn's reply (spec
@@ -327,14 +342,10 @@ fn image_url_is_valid(url: &str) -> bool {
 }
 
 pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip, an image_url or an action is attached.
+    // Content may be empty only when an image_url or an action is attached.
     // A forced image turn gets no exemption: the composer's strongest input is
     // the user's message (spec 2026-08-03 §2.3).
-    if req.content.is_empty()
-        && req.tips_amount_usd.is_none()
-        && req.image_url.is_none()
-        && req.action.is_none()
-    {
+    if req.content.is_empty() && req.image_url.is_none() && req.action.is_none() {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -343,28 +354,7 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
             original_user_message_id: None,
         }));
     }
-    if let Some(amount) = req.tips_amount_usd {
-        if !amount.is_finite() || amount <= 0.0 || amount > MAX_TIP_USD {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "unprocessable",
-                message: format!("tips_amount_usd must be a finite value in (0, {MAX_TIP_USD}]"),
-                user_message: "打赏金额无效".into(),
-                original_user_message_id: None,
-            }));
-        }
-    }
     if let Some(action) = req.action.as_ref() {
-        // Tip turns skip the PDE; an action turn needs the judge (spec 2026-10-05 §3.2).
-        if req.tips_amount_usd.is_some() {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "unprocessable",
-                message: "action cannot be combined with tips_amount_usd".into(),
-                user_message: "打赏消息暂不支持同时做动作".into(),
-                original_user_message_id: None,
-            }));
-        }
         if let Err(message) = action.to_core() {
             return Err(AppError::StreamPre(StreamPreError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -411,15 +401,6 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
     }
     validate_tier(req.tier.as_deref())?;
     if let Some(url) = req.image_url.as_deref() {
-        if req.tips_amount_usd.is_some() {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "unprocessable",
-                message: "image_url cannot be combined with tips_amount_usd".into(),
-                user_message: "图片消息暂不支持同时打赏".into(),
-                original_user_message_id: None,
-            }));
-        }
         if !image_url_is_valid(url) {
             return Err(AppError::StreamPre(StreamPreError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -431,15 +412,6 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
         }
     }
     if let Some(img) = req.image.as_ref() {
-        if img.force && req.tips_amount_usd.is_some() {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "unprocessable",
-                message: "forced image cannot be combined with tips_amount_usd".into(),
-                user_message: "打赏消息暂不支持图片回复".into(),
-                original_user_message_id: None,
-            }));
-        }
         if let Some(ar) = img.aspect_ratio.as_deref() {
             if !aspect_ratio_supported(ar) {
                 return Err(AppError::StreamPre(StreamPreError {
@@ -595,16 +567,13 @@ pub(crate) async fn resolve_quote(
         }))
 }
 
-// Build metadata: conditionally include tips_amount_usd, tier, and image_url.
+// Build metadata: conditionally include tier and image_url.
 // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
 pub(crate) fn build_user_row_metadata(
     req: &StreamSendRequest,
     quote: Option<&QuotedMessage>,
 ) -> Option<serde_json::Value> {
     let mut meta_map = serde_json::Map::new();
-    if let Some(amount) = req.tips_amount_usd {
-        meta_map.insert("tips_amount_usd".into(), serde_json::json!(amount));
-    }
     if let Some(t) = req.tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
     }
@@ -670,17 +639,6 @@ pub(crate) fn build_user_row_metadata(
         None
     } else {
         Some(serde_json::Value::Object(meta_map))
-    }
-}
-
-pub(crate) fn persisted_content_role(req: &StreamSendRequest) -> (String, &'static str) {
-    match req.tips_amount_usd {
-        Some(amount) if req.content.is_empty() => (
-            format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
-            "gift_user",
-        ),
-        Some(_) => (req.content.clone(), "gift_user"),
-        None => (req.content.clone(), "user"),
     }
 }
 
@@ -780,14 +738,12 @@ pub async fn send_message_stream(
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
 
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
-    let (persisted_content, persisted_role) = persisted_content_role(&req);
     let params_value = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
         affinity_scope: req.affinity_scope.clone(),
         prompt_traits: req.prompt_traits.clone(),
         audit: req.audit.clone(),
-        tips_amount_usd: req.tips_amount_usd,
         image_url: req.image_url.clone(),
         image: req.image.clone(),
         reply_to_message_id: req.reply_to_message_id,
@@ -804,9 +760,9 @@ pub async fn send_message_stream(
     let outcome = queue_repo
         .enqueue_user_message_claimed(
             session_id,
-            &persisted_content,
+            &req.content,
             &req.client_msg_id,
-            persisted_role,
+            "user",
             persisted_metadata.as_ref(),
             user_id,
             &params_value,
@@ -833,13 +789,12 @@ pub async fn send_message_stream(
                     session_id,
                     user_id,
                     instance_id,
-                    content: persisted_content.clone(),
+                    content: req.content.clone(),
                     prompt_traits: prompt_traits.clone(),
                     audit: audit.clone(),
                     tier: req.tier.clone(),
                     memory_scope,
                     affinity_scope,
-                    tips_amount_usd: req.tips_amount_usd,
                     image_url: req.image_url.clone(),
                     image: req.image.clone(),
                     quote: quote.clone(),
@@ -1024,28 +979,6 @@ mod tests {
             tier: tier.map(String::from),
             memory_scope: None,
             affinity_scope: None,
-            tips_amount_usd: None,
-            image_url: None,
-            image: None,
-            reply_to_message_id: None,
-            user_timezone: None,
-            user_country: None,
-            user_region: None,
-            action: None,
-            byok: None,
-        }
-    }
-
-    fn req_tip(amount: Option<f64>, content: &str) -> StreamSendRequest {
-        StreamSendRequest {
-            content: content.into(),
-            client_msg_id: "01J5555555555555555555555A".into(),
-            prompt_traits: None,
-            audit: None,
-            tier: None,
-            memory_scope: None,
-            affinity_scope: None,
-            tips_amount_usd: amount,
             image_url: None,
             image: None,
             reply_to_message_id: None,
@@ -1058,29 +991,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_tip_allows_empty_content() {
-        assert!(validate_payload(&req_tip(Some(20.0), "")).is_ok());
+    fn validate_payload_rejects_empty_content_without_image_or_action() {
+        let mut r = req_with_tier(None);
+        r.content = String::new();
+        assert!(validate_payload(&r).is_err());
     }
 
     #[test]
-    fn validate_payload_rejects_empty_content_without_tip() {
-        assert!(validate_payload(&req_tip(None, "")).is_err());
-    }
-
-    #[test]
-    fn validate_payload_rejects_bad_tip_amounts() {
-        assert!(validate_payload(&req_tip(Some(0.0), "")).is_err());
-        assert!(validate_payload(&req_tip(Some(-5.0), "")).is_err());
-        assert!(validate_payload(&req_tip(Some(2_000_000.0), "")).is_err());
-        assert!(validate_payload(&req_tip(Some(f64::NAN), "")).is_err());
-        assert!(validate_payload(&req_tip(Some(f64::INFINITY), "")).is_err());
-    }
-
-    #[test]
-    fn validate_payload_accepts_wellformed_tip() {
-        assert!(validate_payload(&req_tip(Some(2.0), "")).is_ok());
-        assert!(validate_payload(&req_tip(Some(20000.0), "")).is_ok());
-        assert!(validate_payload(&req_tip(Some(1_000_000.0), "")).is_ok());
+    fn a_stale_tips_amount_usd_is_ignored() {
+        let req: StreamSendRequest = serde_json::from_value(json!({
+            "content": "",
+            "client_msg_id": "01J0000000000000000000000A",
+            "tips_amount_usd": 20.0
+        }))
+        .unwrap();
+        assert!(
+            validate_payload(&req).is_err(),
+            "no tip exemption remains: an empty content is rejected"
+        );
+        assert!(
+            build_user_row_metadata(&req, None).is_none(),
+            "nothing of the stale field is stored"
+        );
     }
 
     #[test]
@@ -2666,7 +2598,6 @@ mod validate_payload_tests {
             tier: None,
             memory_scope: None,
             affinity_scope: None,
-            tips_amount_usd: None,
             image_url: None,
             image: None,
             reply_to_message_id: None,
@@ -2687,7 +2618,7 @@ mod validate_payload_tests {
     }
 
     #[test]
-    fn empty_content_rejected_without_image_or_tip() {
+    fn empty_content_rejected_without_image_or_action() {
         let mut r = base();
         r.content = String::new();
         assert!(validate_payload(&r).is_err());
@@ -2757,14 +2688,6 @@ mod validate_payload_tests {
         assert!(validate_payload(&r).is_err());
     }
 
-    #[test]
-    fn tip_plus_image_rejected() {
-        let mut r = base();
-        r.tips_amount_usd = Some(1.0);
-        r.image_url = Some("https://x/y.png".into());
-        assert!(validate_payload(&r).is_err());
-    }
-
     fn minimal_req() -> StreamSendRequest {
         StreamSendRequest {
             content: "hi".into(),
@@ -2774,7 +2697,6 @@ mod validate_payload_tests {
             tier: None,
             memory_scope: None,
             affinity_scope: None,
-            tips_amount_usd: None,
             image_url: None,
             image: None,
             reply_to_message_id: None,
@@ -2784,17 +2706,6 @@ mod validate_payload_tests {
             action: None,
             byok: None,
         }
-    }
-
-    #[test]
-    fn validate_rejects_force_image_with_tip() {
-        let mut req = minimal_req();
-        req.tips_amount_usd = Some(5.0);
-        req.image = Some(ImageReplyParams {
-            force: true,
-            ..Default::default()
-        });
-        assert!(validate_payload(&req).is_err());
     }
 
     #[test]
@@ -2869,6 +2780,7 @@ mod validate_payload_tests {
             name: name.map(String::from),
             quantity,
             text: None,
+            amount_usd: None,
         }
     }
 
@@ -2879,6 +2791,7 @@ mod validate_payload_tests {
             name: None,
             quantity: None,
             text: None,
+            amount_usd: None,
         }
     }
 
@@ -2888,17 +2801,6 @@ mod validate_payload_tests {
         r.content = String::new();
         r.action = Some(bare(UserActionKind::Kiss));
         assert!(validate_payload(&r).is_ok());
-    }
-
-    #[test]
-    fn action_with_tip_rejected_422() {
-        let mut r = base();
-        r.tips_amount_usd = Some(1.0);
-        r.action = Some(bare(UserActionKind::Hug));
-        match validate_payload(&r) {
-            Err(AppError::StreamPre(e)) => assert_eq!(e.status, StatusCode::UNPROCESSABLE_ENTITY),
-            other => panic!("expected a 422 pre-stream error, got {other:?}"),
-        }
     }
 
     #[test]
@@ -2978,6 +2880,86 @@ mod validate_payload_tests {
         assert_eq!(
             meta["action"],
             serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2})
+        );
+    }
+
+    fn tip(amount: Option<f64>) -> UserActionDto {
+        UserActionDto {
+            kind: UserActionKind::Tip,
+            item: None,
+            name: None,
+            quantity: None,
+            text: None,
+            amount_usd: amount,
+        }
+    }
+
+    #[test]
+    fn tip_converts_within_bounds() {
+        assert_eq!(
+            tip(Some(20.0)).to_core().unwrap(),
+            UserAction::Tip { amount_usd: 20.0 }
+        );
+        assert!(tip(None).to_core().is_err(), "tip requires amount_usd");
+        for bad in [0.0, -5.0, 1_000_000_000.01, f64::NAN, f64::INFINITY] {
+            assert!(tip(Some(bad)).to_core().is_err(), "{bad}");
+        }
+        assert!(tip(Some(0.01)).to_core().is_ok());
+        assert!(
+            tip(Some(1_000_000_000.0)).to_core().is_ok(),
+            "the cap itself"
+        );
+    }
+
+    #[test]
+    fn a_tip_validates_with_empty_content_and_with_images() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(tip(Some(20.0)));
+        assert!(validate_payload(&r).is_ok(), "empty content");
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok(), "with image_url");
+        let mut forced = base();
+        forced.action = Some(tip(Some(20.0)));
+        forced.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
+        assert!(validate_payload(&forced).is_ok(), "with a forced image");
+    }
+
+    #[test]
+    fn a_bad_tip_is_a_422() {
+        let mut r = base();
+        r.action = Some(tip(Some(0.0)));
+        match validate_payload(&r) {
+            Err(AppError::StreamPre(e)) => assert_eq!(e.status, StatusCode::UNPROCESSABLE_ENTITY),
+            other => panic!("expected a 422 pre-stream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tip_body_with_an_integer_amount_parses() {
+        let req: StreamSendRequest = serde_json::from_value(serde_json::json!({
+            "content": "",
+            "client_msg_id": "01J0000000000000000000000A",
+            "action": {"type": "tip", "amount_usd": 20}
+        }))
+        .unwrap();
+        assert_eq!(
+            req.action.unwrap().to_core().unwrap(),
+            UserAction::Tip { amount_usd: 20.0 }
+        );
+    }
+
+    #[test]
+    fn user_row_metadata_carries_a_tip() {
+        let mut r = base();
+        r.action = Some(tip(Some(20.0)));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        assert_eq!(
+            meta["action"],
+            serde_json::json!({"type": "tip", "amount_usd": 20.0})
         );
     }
 }

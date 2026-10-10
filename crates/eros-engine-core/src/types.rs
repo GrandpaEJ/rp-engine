@@ -65,11 +65,6 @@ pub enum Event {
         /// Defaults to `bond` when absent.
         #[serde(default)]
         affinity_scope: AffinityScope,
-        /// Optional caller-supplied tip amount in USD. When `Some`, this turn
-        /// is a tip: the PDE forces a reply (never ghost) and the reply prompt
-        /// gets a tip fragment. `None` for normal messages.
-        #[serde(default)]
-        tips_amount_usd: Option<f64>,
         /// The message this turn quotes, resolved from the caller's
         /// `reply_to_message_id`. `None` on ordinary turns and when the id did
         /// not resolve. Never affects which history rows are injected — a
@@ -77,8 +72,7 @@ pub enum Event {
         #[serde(default)]
         quote: Option<QuotedMessage>,
         /// What the user did this turn besides talking. `None` on ordinary
-        /// turns. Mutually exclusive with `tips_amount_usd` (the HTTP layer
-        /// rejects both together).
+        /// turns.
         #[serde(default)]
         action: Option<UserAction>,
     },
@@ -110,7 +104,7 @@ pub struct QuotedMessage {
 /// What a user's turn does to the persona besides talking (spec
 /// 2026-10-05-chat-user-actions-design.md). Stored verbatim as the user row's
 /// `metadata.action`, so the serde shape is a persisted contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserAction {
     Give {
@@ -126,15 +120,22 @@ pub enum UserAction {
     Custom {
         text: String,
     },
+    /// Money handed over (spec 2026-10-11-tip-as-action-design.md). The amount
+    /// is the caller's; the engine records it and never verifies it.
+    Tip {
+        amount_usd: f64,
+    },
 }
 
 impl UserAction {
     /// The line a refusal of this action drops: handing something over is
-    /// friendship, every physical gesture is romance.
-    pub fn line(&self) -> AffinityLine {
+    /// friendship, every physical gesture is romance. A refused tip drops
+    /// nothing (spec 2026-10-11 §6).
+    pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } => AffinityLine::Bond,
-            _ => AffinityLine::Chemistry,
+            UserAction::Give { .. } => Some(AffinityLine::Bond),
+            UserAction::Tip { .. } => None,
+            _ => Some(AffinityLine::Chemistry),
         }
     }
 }
@@ -438,23 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn event_user_message_defaults_tips_amount_to_none() {
-        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
-        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
-        match ev {
-            Event::UserMessage {
-                tips_amount_usd, ..
-            } => {
-                assert!(
-                    tips_amount_usd.is_none(),
-                    "missing field must default to None"
-                );
-            }
-            _ => panic!("expected UserMessage"),
-        }
-    }
-
-    #[test]
     fn chat_response_defaults_audit_fields_to_none() {
         let r = ChatResponse {
             reply: "hi".into(),
@@ -543,7 +527,7 @@ mod tests {
             name: None,
             quantity: 1,
         };
-        assert_eq!(give.line(), AffinityLine::Bond);
+        assert_eq!(give.refusal_line().unwrap(), AffinityLine::Bond);
         for a in [
             UserAction::Kiss,
             UserAction::Hug,
@@ -551,8 +535,25 @@ mod tests {
             UserAction::Lick,
             UserAction::Custom { text: "x".into() },
         ] {
-            assert_eq!(a.line(), AffinityLine::Chemistry, "{a:?}");
+            assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
         }
+    }
+
+    #[test]
+    fn tip_action_serde_shape() {
+        let tip = UserAction::Tip { amount_usd: 20.0 };
+        assert_eq!(
+            serde_json::to_value(&tip).unwrap(),
+            serde_json::json!({"type": "tip", "amount_usd": 20.0})
+        );
+        let back: UserAction =
+            serde_json::from_value(serde_json::json!({"type": "tip", "amount_usd": 9.99})).unwrap();
+        assert_eq!(back, UserAction::Tip { amount_usd: 9.99 });
+    }
+
+    #[test]
+    fn a_refused_tip_drops_no_line() {
+        assert_eq!(UserAction::Tip { amount_usd: 20.0 }.refusal_line(), None);
     }
 
     #[test]
