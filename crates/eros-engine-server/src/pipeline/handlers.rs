@@ -913,8 +913,10 @@ pub(crate) async fn build_reply_request(
             });
 
     // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
-    // full: [character_state] was the one addition in that change, so the flag
-    // must suppress it too, not just the strip and the ladder below.
+    // full: the insight lines were the [character_state] addition in that
+    // change, so the flag suppresses them too, not just the strip and the
+    // ladder below. The block's other lines (items, wardrobe, outfit) still
+    // render.
     let character_state_for_prompt = if state.config.chat_noise_cancellation_disabled {
         None
     } else {
@@ -1760,6 +1762,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));
@@ -2060,6 +2063,7 @@ mod tests {
                 owner_uid: oid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 
@@ -2793,6 +2797,7 @@ mod tests {
                 owner_uid: owner,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 
@@ -2936,6 +2941,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3057,6 +3063,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             // No persona timezone ⇒ the persona clock falls back to the user's.
@@ -3193,6 +3200,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3301,6 +3309,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3615,6 +3624,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),

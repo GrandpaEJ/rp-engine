@@ -40,6 +40,36 @@ const MAX_TIP_USD: f64 = 1_000_000_000.0;
 const MAX_ACTION_NAME_CHARS: usize = 32;
 const MAX_ACTION_TEXT_CHARS: usize = 100;
 const MAX_ACTION_QUANTITY: u32 = 99;
+/// An item name or an outfit (spec 2026-10-12-persona-items-and-gift-design.md §3.2).
+pub(crate) const MAX_ITEM_NAME_CHARS: usize = 64;
+
+/// Validate an item name or an outfit: trimmed, `1..=64` chars, no line-break
+/// or control characters. `Err` carries the reason for the 422, naming `field`.
+pub(crate) fn item_name(raw: &str, field: &str) -> Result<String, String> {
+    let t = raw.trim();
+    let n = t.chars().count();
+    if n == 0 || n > MAX_ITEM_NAME_CHARS {
+        return Err(format!(
+            "{field} must be 1..={MAX_ITEM_NAME_CHARS} chars after trim"
+        ));
+    }
+    if t.chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+    {
+        return Err(format!(
+            "{field} must not contain line-break or control characters"
+        ));
+    }
+    Ok(t.to_string())
+}
+
+/// The request's `outfit`, validated as an item name; blank reads as absent.
+pub(crate) fn validated_outfit(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw {
+        Some(o) if !o.trim().is_empty() => item_name(o, "outfit").map(Some),
+        _ => Ok(None),
+    }
+}
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -125,31 +155,64 @@ pub enum UserActionKind {
     Lick,
     Custom,
     Tip,
+    Gift,
 }
 
 /// What a `give` action hands over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum GiftItemDto {
+pub enum GivenItemDto {
     Cigarette,
     Alcohol,
     Medicine,
 }
 
+/// Which of the persona's lists an item joins: `item` (what she owns) or
+/// `clothing` (her wardrobe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKindDto {
+    Item,
+    Clothing,
+}
+
+impl From<ItemKindDto> for eros_engine_core::types::ItemKind {
+    fn from(k: ItemKindDto) -> Self {
+        match k {
+            ItemKindDto::Item => Self::Item,
+            ItemKindDto::Clothing => Self::Clothing,
+        }
+    }
+}
+
+impl From<eros_engine_core::types::ItemKind> for ItemKindDto {
+    fn from(k: eros_engine_core::types::ItemKind) -> Self {
+        match k {
+            eros_engine_core::types::ItemKind::Item => Self::Item,
+            eros_engine_core::types::ItemKind::Clothing => Self::Clothing,
+        }
+    }
+}
+
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give` → bond, every physical or custom action →
-/// chemistry); a refused `tip` costs nothing.
+/// the line the action touches (`give` and `gift` → bond, every physical or custom action →
+/// chemistry); a refused `tip` costs nothing. An accepted `gift` joins the
+/// persona's items or wardrobe.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
     pub kind: UserActionKind,
     /// `give` only, and required there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item: Option<GiftItemDto>,
-    /// `give` only: a short name for what is handed over, 1–32 chars.
+    pub item: Option<GivenItemDto>,
+    /// `gift` only, and required there: which list the gift joins.
+    #[serde(rename = "kind", default, skip_serializing_if = "Option::is_none")]
+    pub item_kind: Option<ItemKindDto>,
+    /// `give`: optional, a short name for what is handed over, 1–32 chars.
+    /// `gift`: required, what is given, 1–64 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(max_length = 32)]
+    #[schema(max_length = 64)]
     pub name: Option<String>,
     /// `give` only: 1–99, default 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,7 +234,7 @@ impl UserActionDto {
     /// Validate and convert to the engine's action. `Err` carries the reason
     /// for the 422.
     pub(crate) fn to_core(&self) -> Result<eros_engine_core::types::UserAction, String> {
-        use eros_engine_core::types::{GiftItem, UserAction};
+        use eros_engine_core::types::{GivenItem, UserAction};
         fn free_text(raw: Option<&str>, field: &str, max: usize) -> Result<Option<String>, String> {
             let Some(raw) = raw else {
                 return Ok(None);
@@ -193,9 +256,9 @@ impl UserActionDto {
         Ok(match self.kind {
             UserActionKind::Give => {
                 let item = match self.item.ok_or("action.item is required for give")? {
-                    GiftItemDto::Cigarette => GiftItem::Cigarette,
-                    GiftItemDto::Alcohol => GiftItem::Alcohol,
-                    GiftItemDto::Medicine => GiftItem::Medicine,
+                    GivenItemDto::Cigarette => GivenItem::Cigarette,
+                    GivenItemDto::Alcohol => GivenItem::Alcohol,
+                    GivenItemDto::Medicine => GivenItem::Medicine,
                 };
                 let quantity = self.quantity.unwrap_or(1);
                 if !(1..=MAX_ACTION_QUANTITY).contains(&quantity) {
@@ -226,6 +289,18 @@ impl UserActionDto {
                 }
                 UserAction::Tip { amount_usd }
             }
+            UserActionKind::Gift => UserAction::Gift {
+                kind: self
+                    .item_kind
+                    .ok_or("action.kind is required for gift")?
+                    .into(),
+                name: item_name(
+                    self.name
+                        .as_deref()
+                        .ok_or("action.name is required for gift")?,
+                    "action.name",
+                )?,
+            },
         })
     }
 }
@@ -298,6 +373,13 @@ pub struct StreamSendRequest {
     /// [`UserActionDto`]). With an action, `content` may be empty.
     #[serde(default)]
     pub action: Option<UserActionDto>,
+    /// The outfit the persona wears this turn, typically one of her wardrobe
+    /// entries (`GET /v2/comp/instance/{instance_id}/items`); not checked
+    /// against it. 1–64 chars after trim; blank reads as absent. Absent ⇒ the
+    /// judge picks from the wardrobe.
+    #[serde(default)]
+    #[schema(max_length = 64)]
+    pub outfit: Option<String>,
     /// Bring-your-own-key configuration for this turn's reply (spec
     /// 2026-10-08-byok-chat). Honoured only with the deployment's
     /// `X-Byok-Caller-Secret` header; refused on the async route.
@@ -364,6 +446,15 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
                 original_user_message_id: None,
             }));
         }
+    }
+    if let Err(message) = validated_outfit(req.outfit.as_deref()) {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message,
+            user_message: "穿着无效".into(),
+            original_user_message_id: None,
+        }));
     }
     if req.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(AppError::StreamPre(StreamPreError {
@@ -588,6 +679,10 @@ pub(crate) fn build_user_row_metadata(
             serde_json::to_value(&a).expect("UserAction serializes"),
         );
     }
+    // What the caller named for her to wear (spec 2026-10-12 §6.2).
+    if let Ok(Some(o)) = validated_outfit(req.outfit.as_deref()) {
+        meta_map.insert("outfit".into(), serde_json::json!(o));
+    }
     // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
     // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
     // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
@@ -751,6 +846,7 @@ pub async fn send_message_stream(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
         byok: req.byok.as_ref().map(|b| crate::byok::QueuedByok {
             fallback_to_platform: b.fallback_to_platform,
         }),
@@ -804,6 +900,7 @@ pub async fn send_message_stream(
                         req.user_region.as_deref(),
                     ),
                     action: req.action.as_ref().and_then(|a| a.to_core().ok()),
+                    outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
                 };
                 let turn = ClaimedTurn {
                     queue_id,
@@ -987,6 +1084,7 @@ mod tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -2699,7 +2797,7 @@ data: [DONE]\n\n";
 #[cfg(test)]
 mod validate_payload_tests {
     use super::*;
-    use eros_engine_core::types::{GiftItem, UserAction};
+    use eros_engine_core::types::{GivenItem, UserAction};
 
     fn base() -> StreamSendRequest {
         StreamSendRequest {
@@ -2718,6 +2816,7 @@ mod validate_payload_tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -2817,6 +2916,7 @@ mod validate_payload_tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -2888,7 +2988,8 @@ mod validate_payload_tests {
     fn give(name: Option<&str>, quantity: Option<u32>) -> UserActionDto {
         UserActionDto {
             kind: UserActionKind::Give,
-            item: Some(GiftItemDto::Alcohol),
+            item: Some(GivenItemDto::Alcohol),
+            item_kind: None,
             name: name.map(String::from),
             quantity,
             text: None,
@@ -2900,6 +3001,7 @@ mod validate_payload_tests {
         UserActionDto {
             kind,
             item: None,
+            item_kind: None,
             name: None,
             quantity: None,
             text: None,
@@ -2929,7 +3031,7 @@ mod validate_payload_tests {
         assert_eq!(
             a,
             UserAction::Give {
-                item: GiftItem::Alcohol,
+                item: GivenItem::Alcohol,
                 name: Some("威士忌".into()),
                 quantity: 1
             }
@@ -2985,6 +3087,40 @@ mod validate_payload_tests {
     }
 
     #[test]
+    fn outfit_validates_and_blank_reads_as_absent() {
+        assert_eq!(validated_outfit(None).unwrap(), None);
+        assert_eq!(validated_outfit(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validated_outfit(Some("　红色旗袍　")).unwrap().as_deref(),
+            Some("红色旗袍")
+        );
+        assert!(validated_outfit(Some(&"字".repeat(65))).is_err());
+        assert!(validated_outfit(Some("红色\n旗袍")).is_err());
+
+        let mut r = base();
+        r.outfit = Some("字".repeat(65));
+        assert!(validate_payload(&r).is_err());
+        r.outfit = Some("红色旗袍".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn user_row_metadata_carries_the_outfit_trimmed() {
+        let mut r = base();
+        r.outfit = Some(" 红色旗袍 ".into());
+        assert_eq!(
+            build_user_row_metadata(&r, None).unwrap()["outfit"],
+            "红色旗袍"
+        );
+        r.outfit = Some("  ".into());
+        let meta = build_user_row_metadata(&r, None);
+        assert!(
+            meta.as_ref().is_none_or(|m| m.get("outfit").is_none()),
+            "{meta:?}"
+        );
+    }
+
+    #[test]
     fn user_row_metadata_carries_the_validated_action() {
         let mut r = base();
         r.action = Some(give(Some("威士忌"), Some(2)));
@@ -2999,6 +3135,7 @@ mod validate_payload_tests {
         UserActionDto {
             kind: UserActionKind::Tip,
             item: None,
+            item_kind: None,
             name: None,
             quantity: None,
             text: None,
@@ -3020,6 +3157,95 @@ mod validate_payload_tests {
         assert!(
             tip(Some(1_000_000_000.0)).to_core().is_ok(),
             "the cap itself"
+        );
+    }
+
+    fn gift(kind: Option<ItemKindDto>, name: Option<&str>) -> UserActionDto {
+        UserActionDto {
+            kind: UserActionKind::Gift,
+            item: None,
+            item_kind: kind,
+            name: name.map(String::from),
+            quantity: None,
+            text: None,
+            amount_usd: None,
+        }
+    }
+
+    #[test]
+    fn gift_converts_and_trims_its_name() {
+        use eros_engine_core::types::ItemKind;
+        assert_eq!(
+            gift(Some(ItemKindDto::Clothing), Some("　红色旗袍　"))
+                .to_core()
+                .unwrap(),
+            UserAction::Gift {
+                kind: ItemKind::Clothing,
+                name: "红色旗袍".into()
+            }
+        );
+        assert!(
+            gift(None, Some("摩托车")).to_core().is_err(),
+            "kind required"
+        );
+        assert!(
+            gift(Some(ItemKindDto::Item), None).to_core().is_err(),
+            "name required"
+        );
+        assert!(gift(Some(ItemKindDto::Item), Some("   "))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some(&"字".repeat(64)))
+            .to_core()
+            .is_ok());
+        assert!(gift(Some(ItemKindDto::Item), Some(&"字".repeat(65)))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some("摩托\n车"))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some("摩托\u{2028}车"))
+            .to_core()
+            .is_err());
+    }
+
+    #[test]
+    fn a_gift_validates_with_empty_content() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(gift(Some(ItemKindDto::Item), Some("摩托车")));
+        assert!(validate_payload(&r).is_ok());
+        r.action = Some(gift(None, Some("摩托车")));
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn a_gift_parses_from_the_wire_and_from_stored_metadata() {
+        let dto: UserActionDto = serde_json::from_value(
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"}),
+        )
+        .unwrap();
+        assert_eq!(dto.item_kind, Some(ItemKindDto::Clothing));
+        let view = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "gift", "kind": "item", "name": "摩托车", "response": "accept"}
+        ))
+        .unwrap();
+        assert_eq!(view.action.item_kind, Some(ItemKindDto::Item));
+        assert_eq!(view.response, Some(ActionResponseDto::Accept));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({"type": "gift", "kind": "item", "name": "摩托车", "response": "accept"})
+        );
+    }
+
+    #[test]
+    fn user_row_metadata_carries_a_gift() {
+        let mut r = base();
+        r.action = Some(gift(Some(ItemKindDto::Clothing), Some("红色旗袍")));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        assert_eq!(
+            meta["action"],
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"})
         );
     }
 

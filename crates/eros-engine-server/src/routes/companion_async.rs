@@ -59,6 +59,9 @@ pub(crate) struct QueuedTurnParams {
     pub user_region: Option<String>,
     #[serde(default)]
     pub action: Option<crate::routes::companion_stream::UserActionDto>,
+    /// The validated outfit (spec 2026-10-12 §6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outfit: Option<String>,
     /// That the turn asked for BYOK, and what to do when it cannot be
     /// served (spec 2026-10-08 §9.1). Never the endpoints, models or key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +167,9 @@ pub async fn send_message_async(
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
 
+    let outfit = crate::routes::companion_stream::validated_outfit(req.outfit.as_deref())
+        .ok()
+        .flatten();
     let params = serde_json::to_value(QueuedTurnParams {
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
@@ -177,6 +183,7 @@ pub async fn send_message_async(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        outfit,
         byok: None,
     })
     .expect("QueuedTurnParams serializes");
@@ -611,12 +618,22 @@ mod tests {
     }
 
     #[test]
+    fn queued_params_carry_the_outfit_and_old_rows_parse_without_it() {
+        let params: super::QueuedTurnParams =
+            serde_json::from_value(json!({"outfit": "红色旗袍"})).unwrap();
+        assert_eq!(params.outfit.as_deref(), Some("红色旗袍"));
+        let legacy: super::QueuedTurnParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy.outfit, None);
+    }
+
+    #[test]
     fn queued_params_round_trip_the_action() {
         use crate::routes::companion_stream::{UserActionDto, UserActionKind};
         let params = super::QueuedTurnParams {
             action: Some(UserActionDto {
                 kind: UserActionKind::Custom,
                 item: None,
+                item_kind: None,
                 name: None,
                 quantity: None,
                 text: Some("捏了捏你的脸".into()),
@@ -646,6 +663,21 @@ mod tests {
         assert_eq!(
             params.action.unwrap().to_core().unwrap(),
             eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 }
+        );
+    }
+
+    #[test]
+    fn queued_params_rebuild_a_gift() {
+        let params: super::QueuedTurnParams = serde_json::from_value(
+            json!({"action": {"type": "gift", "kind": "item", "name": "摩托车"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            params.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Gift {
+                kind: eros_engine_core::types::ItemKind::Item,
+                name: "摩托车".into()
+            }
         );
     }
 

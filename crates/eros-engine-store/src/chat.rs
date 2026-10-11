@@ -932,19 +932,44 @@ impl<'a> ChatRepo<'a> {
         Ok(outcome)
     }
 
-    /// Record the response in effect for this user row's action (spec
+    /// Write the decided response into the row's `metadata.action` (spec
     /// 2026-10-05-chat-user-actions-design.md §3.3). A row without
     /// `metadata.action` is left alone. Last write wins: a re-driven turn
     /// re-decides.
+    ///
+    /// On a `gift` the same single statement keeps the persona's items in step
+    /// (spec 2026-10-12-persona-items-and-gift-design.md §4.4): accepted, it
+    /// adds one item, idempotent on the message; refused, it removes the item
+    /// an earlier decision added. A stored gift whose kind or name is
+    /// malformed adds nothing and does not fail the write.
     pub async fn set_action_response(
         &self,
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE engine.chat_messages \
-             SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb($2::text)) \
-             WHERE id = $1 AND metadata ? 'action'",
+            "WITH upd AS ( \
+                 UPDATE engine.chat_messages \
+                    SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb($2::text)) \
+                  WHERE id = $1 AND metadata ? 'action' \
+                 RETURNING id, session_id, metadata -> 'action' AS a \
+             ), ins AS ( \
+                 INSERT INTO engine.persona_instance_items \
+                     (instance_id, kind, name, source, user_message_id) \
+                 SELECT s.instance_id, upd.a ->> 'kind', upd.a ->> 'name', 'gift', upd.id \
+                   FROM upd JOIN engine.chat_sessions s ON s.id = upd.session_id \
+                  WHERE $2::text = 'accept' \
+                    AND upd.a ->> 'type' = 'gift' \
+                    AND s.instance_id IS NOT NULL \
+                    AND upd.a ->> 'kind' IN ('item', 'clothing') \
+                    AND COALESCE(upd.a ->> 'name', '') <> '' \
+                 ON CONFLICT (user_message_id) WHERE user_message_id IS NOT NULL DO NOTHING \
+             ) \
+             DELETE FROM engine.persona_instance_items i \
+              USING upd \
+              WHERE $2::text = 'refuse' \
+                AND upd.a ->> 'type' = 'gift' \
+                AND i.user_message_id = upd.id",
         )
         .bind(user_message_id)
         .bind(response.as_str())
@@ -3365,6 +3390,204 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(index, None, "the amount index is gone");
+    }
+
+    const PERSONA_ITEMS_SQL_0067: &str =
+        include_str!("../migrations/0067_persona_instance_items.sql");
+
+    /// 0067: `gift_reaction` rows become `reply`, and the CHECK no longer
+    /// admits it. The migration has already run, so the test restores the
+    /// pre-0067 CHECK, drops the new table, seeds a row and runs it again.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0067_retires_gift_reaction(pool: PgPool) {
+        sqlx::raw_sql(
+            "DROP TABLE engine.persona_instance_items; \
+             ALTER TABLE engine.chat_messages \
+                 DROP CONSTRAINT chat_messages_assistant_action_type_check; \
+             ALTER TABLE engine.chat_messages \
+                 ADD CONSTRAINT chat_messages_assistant_action_type_check \
+                 CHECK (assistant_action_type IS NULL \
+                        OR assistant_action_type IN ('reply', 'gift_reaction', 'proactive'));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type) \
+             VALUES ($1, 'assistant', 'x', 'gift_reaction') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(PERSONA_ITEMS_SQL_0067)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let t: String = sqlx::query_scalar(
+            "SELECT assistant_action_type FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(t, "reply");
+        let rejected = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type) \
+             VALUES ($1, 'assistant', 'x', 'gift_reaction')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await;
+        assert!(
+            rejected.is_err(),
+            "the CHECK no longer admits gift_reaction"
+        );
+    }
+
+    async fn gift_row(pool: &PgPool, session_id: Uuid, action: serde_json::Value) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '', jsonb_build_object('tier', 'gold', 'action', $2::jsonb)) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn items_of(pool: &PgPool) -> Vec<(String, String, String, Option<Uuid>)> {
+        sqlx::query_as(
+            "SELECT kind, name, source, user_message_id \
+             FROM engine.persona_instance_items ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accepted_gift_adds_one_item_and_a_refusal_removes_it(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let id = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"}),
+        )
+        .await;
+        let repo = ChatRepo { pool: &pool };
+
+        repo.set_action_response(id, ActionResponse::Accept)
+            .await
+            .unwrap();
+        repo.set_action_response(id, ActionResponse::Accept)
+            .await
+            .unwrap();
+        assert_eq!(
+            items_of(&pool).await,
+            vec![(
+                "clothing".to_string(),
+                "红色旗袍".to_string(),
+                "gift".to_string(),
+                Some(id)
+            )],
+            "accepting twice (a re-driven turn) adds one item"
+        );
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta["action"]["response"], "accept");
+        assert_eq!(meta["tier"], "gold", "other metadata keys survive");
+
+        repo.set_action_response(id, ActionResponse::Refuse)
+            .await
+            .unwrap();
+        assert!(
+            items_of(&pool).await.is_empty(),
+            "a flip to refuse removes it"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_non_gift_action_touches_no_item(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let id = gift_row(&pool, s.id, serde_json::json!({"type": "kiss"})).await;
+        ChatRepo { pool: &pool }
+            .set_action_response(id, ActionResponse::Accept)
+            .await
+            .unwrap();
+        assert!(items_of(&pool).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_malformed_stored_gift_still_records_the_response(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let repo = ChatRepo { pool: &pool };
+        for action in [
+            serde_json::json!({"type": "gift", "kind": "shoes", "name": "高跟鞋"}),
+            serde_json::json!({"type": "gift", "kind": "item"}),
+        ] {
+            let id = gift_row(&pool, s.id, action).await;
+            repo.set_action_response(id, ActionResponse::Accept)
+                .await
+                .expect("a malformed gift must not fail the write");
+            let r: Option<String> = sqlx::query_scalar(
+                "SELECT metadata #>> '{action,response}' FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(r.as_deref(), Some("accept"));
+        }
+        assert!(items_of(&pool).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_gift_item_outlives_its_message_and_dies_with_its_instance(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let id = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "gift", "kind": "item", "name": "摩托车"}),
+        )
+        .await;
+        ChatRepo { pool: &pool }
+            .set_action_response(id, ActionResponse::Accept)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            items_of(&pool).await,
+            vec![(
+                "item".to_string(),
+                "摩托车".to_string(),
+                "gift".to_string(),
+                None
+            )]
+        );
+        sqlx::query("DELETE FROM engine.persona_instances WHERE id = $1")
+            .bind(s.instance_id.unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(items_of(&pool).await.is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
