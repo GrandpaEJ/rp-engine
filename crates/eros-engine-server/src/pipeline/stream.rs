@@ -4513,15 +4513,11 @@ pub(crate) fn run_stream_with(
         }
 
         // The response in effect for this turn's action (spec 2026-10-05
-        // §4.5): persisted first so a replay can rebuild the frame, then sent
-        // ahead of the reply. A failed write costs the replay only.
+        // §4.5), sent ahead of the reply. History and replay read it off the
+        // row, so it is persisted only once the turn takes effect — where
+        // post-process is spawned below: a turn that ends in `error` leaves no
+        // decision behind.
         if let Some(response) = plan.action_response {
-            if let Err(e) = chat_repo
-                .set_action_response(user_msg.user_message_id, response)
-                .await
-            {
-                tracing::warn!("stream: action response write failed: {e}");
-            }
             yield ProtocolFrame::ActionResponse {
                 user_message_id: user_msg.user_message_id,
                 response,
@@ -5076,6 +5072,16 @@ pub(crate) fn run_stream_with(
                     );
                     yield final_frame;
 
+                    // Stored right before post-process is spawned, with no other
+                    // await between them. A failed write only loses the stored copy.
+                    if let Some(response) = plan.action_response {
+                        if let Err(e) = chat_repo
+                            .set_action_response(user_msg.user_message_id, response)
+                            .await
+                        {
+                            tracing::warn!("stream: action response write failed: {e}");
+                        }
+                    }
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
                     plan_bg.image_caption = image_only_caption;
@@ -5582,6 +5588,16 @@ pub(crate) fn run_stream_with(
                 );
                 yield final_frame;
 
+                // Stored right before post-process is spawned, with no other
+                // await between them. A failed write only loses the stored copy.
+                if let Some(response) = plan.action_response {
+                    if let Err(e) = chat_repo
+                        .set_action_response(user_msg.user_message_id, response)
+                        .await
+                    {
+                        tracing::warn!("stream: action response write failed: {e}");
+                    }
+                }
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
                 let mut plan_bg = plan.clone();
@@ -8766,6 +8782,18 @@ data: [DONE]\n\n";
         assert!(
             payload.contains("你接受了"),
             "no judge means the action is accepted, and the composer must be told: {payload}"
+        );
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("accept"),
+            "an image-only turn that took effect records the response"
         );
     }
 
