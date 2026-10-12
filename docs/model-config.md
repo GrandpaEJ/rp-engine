@@ -664,6 +664,8 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 
 **Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image action is available this turn (the request carries an `image` block AND `[tasks.chat_image_prompt_compose]` is configured — both must hold), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
 
+When any accepted `give` is still at work, the engine also adds a `[身体状态]` line with the persona's lingering state (e.g. `[身体状态] 3 杯「威士忌」，微醺，还在往上走`; see [API reference](api-reference.md#post-compchatsession_idmessagestream)), before `[用户动作]`; the line is absent otherwise.
+
 **Recent-image context line.** The judge context also always carries exactly one
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`
 line. The engine counts these from the stored rows so the judge never has to
@@ -689,7 +691,7 @@ action, `inner_state`, and (on an image action) the reference/aspect-ratio
 inputs. Producing the actual image prompt is entirely this task's job: when an
 image action is decided, the engine runs the composer **after** the decision
 and **before** generation, feeding it the persona appearance, the current
-outfit, the recent scene, the partner's latest message, the chosen style, and
+outfit, the bodily state, the recent scene, the partner's latest message, the chosen style, and
 the target aspect ratio. The composer **generates** the prompt from that context — it does not
 expand a seed, because none exists anymore.
 
@@ -727,7 +729,7 @@ round-robin cursor on text/ghost turns.
 **Two consumers, one contract.** Besides the chat stream's image turns, the
 standalone `POST /persona/{instance_id}/image/compose` endpoint (see
 [api-reference.md](api-reference.md)) runs this same task with the same
-six-slot payload (`[人物外观] / [此刻穿着] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
+seven-slot payload (`[人物外观] / [此刻穿着] / [身体状态] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
 and the same `filter_prompt` contract — a deployment's custom prompt needs no
 changes to serve both. Two behavioural differences on the endpoint side: the
 `[最近场景]` slot is filled from the request's `scene` field instead of the
@@ -735,7 +737,7 @@ conversation history, and there is **no portrait fallback** — a fully failed
 chain is an HTTP error carrying the provider's own status (the endpoint doubles
 as the composer's test surface, so it reports failure instead of masking it).
 
-`[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. The compose endpoint always sends `（无）`.
+`[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. The compose endpoint always sends `（无）`. `[身体状态]` is the persona's lingering state from accepted gives (see [API reference](api-reference.md#post-compchatsession_idmessagestream)), `（无）` when none; the compose endpoint always sends `（无）`.
 
 ```toml
 [tasks.chat_image_prompt_compose]
@@ -764,7 +766,7 @@ max_tokens   = 700
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
 config), the composer ships a generic, **product-identity-free** built-in
 default. It **generates** the prompt and caption straight from context —
-persona appearance, current outfit, recent scene, the partner's latest message,
+persona appearance, current outfit, bodily state, recent scene, the partner's latest message,
 style, aspect ratio — and does **not** soften, downgrade, censor, or refuse, and adds no
 content-moderation layer of its own — moderation is delegated to the
 image-model provider and the downstream deployment, not this step. A
@@ -846,7 +848,7 @@ trio above rides alongside.
 recorded in `engine.chat_images_events`** (migration 0045): the full usage
 block, the assembled wire prompt (`composed_prompt` — style preset + persona
 appearance + subject, exactly what an image vendor would receive), the
-chain-walk facts (`attempts` / `last_failure`), and the six raw inputs the
+chain-walk facts (`attempts` / `last_failure`), and the seven raw inputs the
 composer saw. `metadata.image.compose_event_id` points at that row — reverse
 lookup runs assistant row → `compose_event_id` → `chat_images_events`, never
 the other way. Usage/cost and the composed wire prompt are *not* duplicated

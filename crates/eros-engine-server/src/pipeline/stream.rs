@@ -143,6 +143,14 @@ pub enum ProtocolFrame {
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
     },
+    /// The persona's lingering state this turn (spec
+    /// 2026-10-12-given-item-lingering-effects-design.md §9.1). Sent once,
+    /// only when non-empty: after `action_response` and before the first
+    /// `meta` on a text turn, before the first `delta` on a voice turn.
+    BodyState {
+        user_message_id: Uuid,
+        effects: Vec<eros_engine_core::effects::ActiveEffect>,
+    },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -201,6 +209,17 @@ pub(crate) fn action_response_frame(
             user_message_id,
             response,
         }
+    })
+}
+
+/// The `body_state` frame for a turn; `None` when nothing is at work.
+pub(crate) fn body_state_frame(
+    user_message_id: Uuid,
+    effects: &[eros_engine_core::effects::ActiveEffect],
+) -> Option<ProtocolFrame> {
+    (!effects.is_empty()).then(|| ProtocolFrame::BodyState {
+        user_message_id,
+        effects: effects.to_vec(),
     })
 }
 
@@ -2657,6 +2676,7 @@ fn build_pde_ctx(
     input: &eros_engine_core::types::DecisionInput,
     image_available: bool,
     product_qa_recent: Option<&str>,
+    body_state: Option<&str>,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -2711,6 +2731,11 @@ fn build_pde_ctx(
             format!("[产品咨询] 本轮可答产品问题=是\n[最近产品咨询]\n{recent}\n")
         }
     };
+    // What accepted gives are still doing to her (spec
+    // 2026-10-12-given-item-lingering-effects-design.md §6.3); absent otherwise.
+    let body_line = body_state
+        .map(|s| format!("[身体状态] {s}\n"))
+        .unwrap_or_default();
     // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
@@ -2751,7 +2776,7 @@ fn build_pde_ctx(
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
-         {product_qa_section}{action_line}{outfit_line}\n\
+         {product_qa_section}{body_line}{action_line}{outfit_line}\n\
          [用户最新消息]\n{latest}",
         s.message_count,
         s.hours_since_last_message,
@@ -3345,13 +3370,14 @@ pub(crate) fn compose_user_payload(
     latest_user_msg: &str,
     style: &str,
     aspect_ratio: &str,
+    body_state: &str,
 ) -> String {
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n[身体状态]\n{body_state}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
-/// The six composer slots as an audit snapshot. Deliberately built from the
+/// The seven composer slots as an audit snapshot. Deliberately built from the
 /// RAW values: `run_image_prompt_compose` substitutes `（无）` for empty slots
 /// when it renders the prompt, and that placeholder is a rendering detail — the
 /// audit records an absent slot as the empty string. Pure.
@@ -3362,12 +3388,14 @@ pub(crate) fn compose_inputs_json(
     latest_user_msg: &str,
     style: &str,
     aspect_ratio: Option<&str>,
+    body_state: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "appearance": crate::prompt::meta_str(persona, "appearance")
             .map(str::trim)
             .unwrap_or(""),
         "clothing": clothing.map(str::trim).unwrap_or(""),
+        "body_state": body_state.map(str::trim).unwrap_or(""),
         "recent_scene": recent_scene.trim(),
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
@@ -3472,7 +3500,7 @@ pub(crate) struct ComposeRun {
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
-/// Render the chat composer's six-slot payload, substituting the placeholders
+/// Render the chat composer's seven-slot payload, substituting the placeholders
 /// the prompt expects for empty slots. Extracted from `run_image_prompt_compose`
 /// so that function is only the chain walk and can serve a second composer
 /// (the image-edit endpoint) with a different payload. Pure.
@@ -3483,12 +3511,17 @@ pub(crate) fn render_compose_payload(
     latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
+    body_state: Option<&str>,
 ) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("（无）");
     let clothing = clothing
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（无）");
+    let body_state = body_state
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("（无）");
@@ -3503,7 +3536,7 @@ pub(crate) fn render_compose_payload(
         latest_user_msg
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    compose_user_payload(appearance, clothing, scene, latest, style, ar)
+    compose_user_payload(appearance, clothing, scene, latest, style, ar, body_state)
 }
 
 /// Walk `[model] + fallback` for a composer task, named by `task`, on
@@ -3761,6 +3794,7 @@ async fn build_delegated_image_prompt(
     latest_user_msg: &str,
     user_id: Uuid,
     session_id: Uuid,
+    body_state: Option<&str>,
 ) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
@@ -3783,6 +3817,7 @@ async fn build_delegated_image_prompt(
                     latest_user_msg,
                     inputs.aspect_ratio.as_deref(),
                     &style_str,
+                    body_state,
                 ),
                 "chat_image_prompt_compose",
             )
@@ -3891,6 +3926,7 @@ async fn build_delegated_image_prompt(
                 latest_user_msg,
                 &style_str,
                 inputs.aspect_ratio.as_deref(),
+                body_state,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
             caption: caption.as_deref(),
@@ -4320,6 +4356,20 @@ pub(crate) fn run_stream_with(
             persona,
             signals,
         };
+        // Lingering effects of accepted gives (spec 2026-10-12-given-item-
+        // lingering-effects-design.md §5): read once and rendered once, so the
+        // judge, the reply and the composer see the same text.
+        let given_effects = crate::pipeline::handlers::load_effects(
+            &state.pool,
+            user_msg.session_id,
+            Some(user_msg.user_message_id),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("stream: lingering effects read failed: {e}");
+            Vec::new()
+        });
+        let body_state = crate::prompt::body_state(&given_effects);
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -4380,6 +4430,7 @@ pub(crate) fn run_stream_with(
                         &input,
                         image_executor_available,
                         product_qa_recent.as_deref(),
+                        body_state.as_deref(),
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -4561,6 +4612,9 @@ pub(crate) fn run_stream_with(
                 user_message_id: user_msg.user_message_id,
                 response,
             };
+        }
+        if let Some(frame) = body_state_frame(user_msg.user_message_id, &given_effects) {
+            yield frame;
         }
 
         match plan.action_type {
@@ -5017,6 +5071,7 @@ pub(crate) fn run_stream_with(
                         &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &user_msg.content),
                         user_msg.user_id,
                         user_msg.session_id,
+                        body_state.as_deref(),
                     )
                     .await;
                     let subject = img.subject;
@@ -5370,6 +5425,7 @@ pub(crate) fn run_stream_with(
                         );
                         let user_id_c = user_msg.user_id;
                         let session_id_c = user_msg.session_id;
+                        let body_state_c = body_state.clone();
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -5380,6 +5436,7 @@ pub(crate) fn run_stream_with(
                                 &latest_c,
                                 user_id_c,
                                 session_id_c,
+                                body_state_c.as_deref(),
                             )
                             .await
                         })))
@@ -5394,6 +5451,7 @@ pub(crate) fn run_stream_with(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     user_msg.user_message_id, &now_ctx, true,
+                    body_state.as_deref(),
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
@@ -5555,6 +5613,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
+                                    body_state.as_deref(),
                                 )
                                 .await
                             }
@@ -5568,6 +5627,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
+                                    body_state.as_deref(),
                                 )
                                 .await
                             }
@@ -6041,6 +6101,7 @@ mod tests {
             "（无）",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(p.contains("freckled, red hair"));
         assert!(p.contains("（无）"));
@@ -6057,6 +6118,7 @@ mod tests {
             "给我看看你现在的样子",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
     }
@@ -6070,6 +6132,7 @@ mod tests {
             "给我看看你现在的样子",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(
             !p.contains("画面主题种子"),
@@ -6944,7 +7007,7 @@ mod tests {
             images_in_window: 2,
             last_assistant_is_image: true,
         };
-        let ctx = build_pde_ctx(&t, &input, true, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=2 张；上一条 AI 消息是图片=是"),
             "facts line must render with a message-based unit: {ctx}"
@@ -6965,7 +7028,7 @@ mod tests {
             images_in_window: 0,
             last_assistant_is_image: false,
         };
-        let ctx = build_pde_ctx(&t, &input, false, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=0 张；上一条 AI 消息是图片=否"),
             "the negative case is a signal too and must always render: {ctx}"
@@ -8848,6 +8911,120 @@ data: [DONE]\n\n";
         .await
         .expect("exactly one compose event row");
         assert_eq!(clothing.as_deref(), Some("红色旗袍"));
+    }
+
+    /// A prior accepted give reaches the composer's `[身体状态]` slot and the
+    /// event row's `inputs.body_state` on a forced image.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_shows_the_body_state(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_outfit",
+                "model": "composer",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she twirls\",\"caption\":\"转圈\"}"}}],
+                "usage": {"total_tokens": 10}
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 1))",
+        )
+        .bind(session_id)
+        .bind(serde_json::json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000D",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("[身体状态]\n1 支烟，烟劲很足，正在劲头上"),
+            "the body state must reach the composer: {payload}"
+        );
+        let body_state: Option<String> = sqlx::query_scalar(
+            "SELECT inputs->>'body_state' FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(body_state.as_deref(), Some("1 支烟，烟劲很足，正在劲头上"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -11603,6 +11780,7 @@ data: [DONE]\n\n";
                 ProtocolFrame::Error { .. } => "error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
                 ProtocolFrame::ActionResponse { .. } => "action_response",
+                ProtocolFrame::BodyState { .. } => "body_state",
             };
             if out.last() != Some(&kind) {
                 out.push(kind);
@@ -17900,7 +18078,7 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ItemKind;
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let bare = build_pde_ctx(&t, &input, false, None);
+        let bare = build_pde_ctx(&t, &input, false, None, None);
         assert!(
             !bare.contains("[你的物品]") && !bare.contains("[你的衣柜]"),
             "{bare}"
@@ -17911,7 +18089,7 @@ data: [DONE]\n\n";
             name: "红色旗袍".into(),
             gifted: true,
         }];
-        let ctx = build_pde_ctx(&t, &input, false, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None);
         assert!(!ctx.contains("[你的物品]"), "{ctx}");
         assert!(
             ctx.contains("[你的衣柜] 「红色旗袍」（对方送的）\n"),
@@ -17949,7 +18127,7 @@ data: [DONE]\n\n";
             transcript: "用户：hi\nMia：hey".into(),
             ..Default::default()
         };
-        let ctx = build_pde_ctx(&t, &input, true, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[亲密度]").expect("relationship bucket present");
         assert!(
@@ -17992,7 +18170,7 @@ data: [DONE]\n\n";
         input.affinity.intimacy = 0.0;
         input.affinity.tension = 0.0; // bond 0.90, chemistry 0.30
         input.affinity.patience = 0.8;
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None);
         assert!(
             ctx.contains("[亲密度] 当前档位=第 3 档\n"),
             "intimacy line carries the rung and nothing else: {ctx}"
@@ -18027,7 +18205,7 @@ data: [DONE]\n\n";
             input.affinity.intrigue = score;
             input.affinity.intimacy = 0.0;
             input.affinity.tension = 0.0;
-            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None);
             assert!(
                 ctx.contains(&format!("当前档位=第 {want} 档")),
                 "S={score} renders rung {want}: {ctx}"
@@ -18035,7 +18213,7 @@ data: [DONE]\n\n";
         }
         for (patience, want) in [(0.349, "低"), (0.35, "中"), (0.649, "中"), (0.65, "高")] {
             input.affinity.patience = patience;
-            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None);
             assert!(
                 ctx.contains(&format!("[耐心] 当前档位={want}")),
                 "patience={patience} renders {want}: {ctx}"
@@ -18055,7 +18233,7 @@ data: [DONE]\n\n";
         input.affinity.intimacy = 0.033;
         input.affinity.tension = 0.033;
         input.affinity.patience = 0.5;
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None, None);
         assert!(
             ctx.contains("[亲密度] 当前档位=第 1 档"),
             "fresh session renders the bottom rung: {ctx}"
@@ -18090,7 +18268,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None, None);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -18115,16 +18293,16 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         // feature off → no lines at all
-        let off = build_pde_ctx(&t, &input, true, None);
+        let off = build_pde_ctx(&t, &input, true, None, None);
         assert!(!off.contains("[产品咨询]"));
         assert!(!off.contains("[最近产品咨询]"));
         // on, no history → availability line only
-        let on_empty = build_pde_ctx(&t, &input, true, Some(""));
+        let on_empty = build_pde_ctx(&t, &input, true, Some(""), None);
         assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
         assert!(!on_empty.contains("[最近产品咨询]"));
         // on, with history → both blocks, before [用户最新消息]
         let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
-        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent));
+        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent), None);
         assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
         assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
@@ -18226,14 +18404,37 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn build_pde_ctx_states_the_body_state_before_the_action() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let bare = build_pde_ctx(&t, &input, false, None, None);
+        assert!(!bare.contains("[身体状态]"), "{bare}");
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(eros_engine_core::types::UserAction::Kiss);
+        }
+        let ctx = build_pde_ctx(
+            &t,
+            &input,
+            false,
+            None,
+            Some("1 支烟，烟劲很足，正在劲头上"),
+        );
+        let body = ctx
+            .find("[身体状态] 1 支烟，烟劲很足，正在劲头上\n")
+            .expect(&ctx);
+        assert!(ctx.find("[近期图片]").unwrap() < body, "{ctx}");
+        assert!(body < ctx.find("[用户动作]").unwrap(), "{ctx}");
+    }
+
+    #[test]
     fn build_pde_ctx_states_a_named_outfit() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        assert!(!build_pde_ctx(&t, &input, false, None).contains("[指定穿着]"));
+        assert!(!build_pde_ctx(&t, &input, false, None, None).contains("[指定穿着]"));
         if let Event::UserMessage { outfit, .. } = &mut input.event {
             *outfit = Some("红色旗袍".into());
         }
-        let ctx = build_pde_ctx(&t, &input, false, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None);
         assert!(ctx.contains("[指定穿着] 「红色旗袍」\n"), "{ctx}");
         assert!(
             ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -18247,6 +18448,7 @@ data: [DONE]\n\n";
             &pool,
             eros_engine_core::types::UserAction::Hug,
             Some("红色旗袍".into()),
+            &[],
             serde_json::json!({"action": "reply_text", "inner_state": "", "clothing": "运动服"}),
             200,
         )
@@ -18267,12 +18469,12 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_action_line_only_on_action_turns() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let plain = build_pde_ctx(&t, &input, false, None);
+        let plain = build_pde_ctx(&t, &input, false, None, None);
         assert!(!plain.contains("[用户动作]"), "{plain}");
         if let Event::UserMessage { action, .. } = &mut input.event {
             *action = Some(eros_engine_core::types::UserAction::Kiss);
         }
-        let ctx = build_pde_ctx(&t, &input, false, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None);
         assert!(ctx.contains("[用户动作] 对方凑过来想亲你\n"), "{ctx}");
         assert!(
             ctx.find("[用户动作]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -20285,7 +20487,7 @@ data: [DONE]\n\n"
         // run_image_prompt_compose: the extraction must not change what the
         // chat path sends.
         let persona = test_persona_with_appearance("");
-        let out = render_compose_payload(&persona, None, "  ", "", None, "realistic");
+        let out = render_compose_payload(&persona, None, "  ", "", None, "realistic", None);
         assert!(out.contains("[人物外观]\n（无）"), "got {out}");
         assert!(out.contains("[最近场景]\n（无）"), "got {out}");
         assert!(out.contains("[对方最新消息]\n（无）"), "got {out}");
@@ -20296,7 +20498,15 @@ data: [DONE]\n\n"
     #[test]
     fn render_compose_payload_passes_real_values_through() {
         let persona = test_persona_with_appearance("银发红瞳");
-        let out = render_compose_payload(&persona, None, "在天台", "拍张照", Some("3:4"), "anime");
+        let out = render_compose_payload(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            Some("3:4"),
+            "anime",
+            None,
+        );
         assert!(out.contains("[人物外观]\n银发红瞳"), "got {out}");
         assert!(out.contains("[最近场景]\n在天台"), "got {out}");
         assert!(out.contains("[对方最新消息]\n拍张照"), "got {out}");
@@ -20313,24 +20523,84 @@ data: [DONE]\n\n"
             "拍张照",
             None,
             "anime",
+            None,
         );
         assert!(
-            dressed.contains("[人物外观]\n银发红瞳\n\n[此刻穿着]\n红色旗袍\n\n[最近场景]"),
+            dressed.contains(
+                "[人物外观]\n银发红瞳\n\n[此刻穿着]\n红色旗袍\n\n[身体状态]\n（无）\n\n[最近场景]"
+            ),
             "{dressed}"
         );
-        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime");
+        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime", None);
         assert!(bare.contains("[此刻穿着]\n（无）"), "{bare}");
-        let blank = render_compose_payload(&persona, Some("  "), "在天台", "拍张照", None, "anime");
+        let blank = render_compose_payload(
+            &persona,
+            Some("  "),
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            None,
+        );
         assert!(blank.contains("[此刻穿着]\n（无）"), "{blank}");
     }
 
     #[test]
     fn compose_inputs_record_the_clothing() {
         let persona = test_persona_with_appearance("银发红瞳");
-        let v = compose_inputs_json(&persona, Some(" 红色旗袍 "), "s", "m", "anime", None);
+        let v = compose_inputs_json(&persona, Some(" 红色旗袍 "), "s", "m", "anime", None, None);
         assert_eq!(v["clothing"], "红色旗袍");
-        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None);
+        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
         assert_eq!(v["clothing"], "");
+    }
+
+    #[test]
+    fn the_composer_reads_the_body_state() {
+        let persona = test_persona_with_appearance("银发红瞳");
+        let out = render_compose_payload(
+            &persona,
+            Some("红色旗袍"),
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            Some("1 支烟，烟劲很足，正在劲头上"),
+        );
+        assert!(
+            out.contains(
+                "[此刻穿着]\n红色旗袍\n\n[身体状态]\n1 支烟，烟劲很足，正在劲头上\n\n[最近场景]"
+            ),
+            "{out}"
+        );
+        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime", None);
+        assert!(bare.contains("[身体状态]\n（无）"), "{bare}");
+        let blank = render_compose_payload(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            Some("  "),
+        );
+        assert!(blank.contains("[身体状态]\n（无）"), "{blank}");
+    }
+
+    #[test]
+    fn compose_inputs_record_the_body_state() {
+        let persona = test_persona_with_appearance("银发红瞳");
+        let v = compose_inputs_json(
+            &persona,
+            None,
+            "s",
+            "m",
+            "anime",
+            None,
+            Some(" 1 支烟，烟劲很足，正在劲头上 "),
+        );
+        assert_eq!(v["body_state"], "1 支烟，烟劲很足，正在劲头上");
+        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
+        assert_eq!(v["body_state"], "");
     }
 
     #[test]
@@ -20457,13 +20727,14 @@ data: [DONE]\n\n"
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
-        run_action_turn_full(pool, action, None, verdict, judge_status).await
+        run_action_turn_full(pool, action, None, &[], verdict, judge_status).await
     }
 
     async fn run_action_turn_full(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
         outfit: Option<String>,
+        prior: &[serde_json::Value],
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
@@ -20510,6 +20781,18 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
+        for (i, meta) in prior.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, 'user', '', $2, now() - make_interval(mins => $3))",
+            )
+            .bind(session_id)
+            .bind(meta)
+            .bind((prior.len() - i) as i32)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
         let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
         let umid = match (ChatRepo { pool })
             .upsert_user_message_idempotent(
@@ -20558,6 +20841,111 @@ data: [DONE]\n\n"
             .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
             .expect("the chat call must have fired");
         String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    fn accepted_give(item: &str, quantity: u8, name: Option<&str>) -> serde_json::Value {
+        let mut action = serde_json::json!({"type": "give", "item": item, "quantity": quantity, "response": "accept"});
+        if let Some(n) = name {
+            action["name"] = serde_json::json!(n);
+        }
+        serde_json::json!({"action": action})
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_after_an_accepted_give_carries_the_body_state(pool: PgPool) {
+        use eros_engine_core::effects::EffectPhase;
+        let (frames, mock, umid) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[accepted_give("alcohol", 3, Some("威士忌"))],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        let pos = |want: &str| {
+            frame_shape(&frames)
+                .iter()
+                .position(|k| *k == want)
+                .unwrap_or_else(|| panic!("no {want}: {frames:?}"))
+        };
+        assert!(pos("action_response") < pos("body_state"));
+        assert!(pos("body_state") < pos("meta"));
+        let body: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::BodyState {
+                    user_message_id,
+                    effects,
+                } => Some((*user_message_id, effects.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(body.len(), 1, "sent once");
+        assert_eq!(body[0].0, umid);
+        let e = &body[0].1[0];
+        assert_eq!(
+            (e.level, e.phase, e.step, e.steps),
+            (1, EffectPhase::Rising, 1, 3)
+        );
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(
+            judge.contains("[身体状态] 3 杯「威士忌」，有一点酒意，还在往上走"),
+            "{judge}"
+        );
+        let chat = chat_request_body(&reqs);
+        assert!(
+            chat.contains("- 身上还带着：3 杯「威士忌」，有一点酒意，还在往上走"),
+            "{chat}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_give_sends_no_body_state(pool: PgPool) {
+        let mut refused = accepted_give("cigarette", 1, None);
+        refused["action"]["response"] = serde_json::json!("refuse");
+        let (frames, mock, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[refused],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert!(!frame_shape(&frames).contains(&"body_state"), "{frames:?}");
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert!(reqs
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("[身体状态]")));
+    }
+
+    /// One harness run per test: the harness seeds a fixed genome name.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_accepting_turn_sends_no_body_state(pool: PgPool) {
+        let (frames, _, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Give {
+                item: eros_engine_core::types::GivenItem::Alcohol,
+                name: None,
+                quantity: 2,
+            },
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert!(
+            !frame_shape(&frames).contains(&"body_state"),
+            "the accepting turn: {frames:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -21182,6 +21570,33 @@ data: [DONE]\n\n"
         assert_eq!(
             status, None,
             "a gateway-layer failure carries no upstream status"
+        );
+    }
+
+    #[test]
+    fn body_state_frame_only_when_there_are_effects() {
+        use eros_engine_core::effects::{ActiveEffect, EffectPhase};
+        use eros_engine_core::types::GivenItem;
+        let id = Uuid::new_v4();
+        assert!(body_state_frame(id, &[]).is_none());
+        let e = ActiveEffect {
+            item: GivenItem::Cigarette,
+            name: None,
+            quantity: 1,
+            level: 3,
+            phase: EffectPhase::Peak,
+            step: 1,
+            steps: 1,
+        };
+        let f = body_state_frame(id, &[e]).expect("a frame");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({
+                "type": "body_state",
+                "user_message_id": id,
+                "effects": [{"item": "cigarette", "quantity": 1, "level": 3,
+                             "phase": "peak", "step": 1, "steps": 1}],
+            })
         );
     }
 }

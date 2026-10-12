@@ -26,6 +26,7 @@
 use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
+use eros_engine_core::effects::{ActiveEffect, EffectPhase};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
@@ -635,17 +636,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
             item,
             name,
             quantity,
-        } => {
-            let (unit, word) = match item {
-                GivenItem::Cigarette => ("支", "烟"),
-                GivenItem::Alcohol => ("杯", "酒"),
-                GivenItem::Medicine => ("片", "药"),
-            };
-            match name {
-                Some(name) => format!("递给你 {quantity} {unit}「{name}」"),
-                None => format!("递给你 {quantity} {unit}{word}"),
-            }
-        }
+        } => format!("递给你 {}", given_phrase(*item, name.as_deref(), *quantity)),
         UserAction::Kiss => "凑过来想亲你".into(),
         UserAction::Hug => "想抱你".into(),
         UserAction::Touch => "伸手想摸你".into(),
@@ -715,6 +706,79 @@ pub(crate) fn action_response_from_metadata(
     meta: Option<&serde_json::Value>,
 ) -> Option<ActionResponse> {
     serde_json::from_value(meta?.get("action")?.get("response")?.clone()).ok()
+}
+
+/// What a `give` hands over, without its verb: 「3 杯「威士忌」」「1 支烟」.
+/// The user-supplied name is quoted with 「」 so it reads as data.
+pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) -> String {
+    let (unit, word) = match item {
+        GivenItem::Cigarette => ("支", "烟"),
+        GivenItem::Alcohol => ("杯", "酒"),
+        GivenItem::Medicine => ("片", "药"),
+    };
+    match name {
+        Some(name) => format!("{quantity} {unit}「{name}」"),
+        None => format!("{quantity} {unit}{word}"),
+    }
+}
+
+/// How strong an effect feels, by item and level 1–4 (spec
+/// 2026-10-12-given-item-lingering-effects-design.md §6.1). Deliberately
+/// says how strong, not what it feels like.
+fn effect_word(item: GivenItem, level: u8) -> &'static str {
+    const CIGARETTE: [&str; 4] = ["余味还在", "还有点飘", "烟劲很足", "抽得头晕"];
+    const ALCOHOL: [&str; 4] = ["有一点酒意", "微醺", "醉意上头", "醉得厉害"];
+    const MEDICINE: [&str; 4] = ["药效轻微", "药效明显", "药效很强", "药劲过猛"];
+    let words = match item {
+        GivenItem::Cigarette => &CIGARETTE,
+        GivenItem::Alcohol => &ALCOHOL,
+        GivenItem::Medicine => &MEDICINE,
+    };
+    words[usize::from(level.clamp(1, 4)) - 1]
+}
+
+fn effect_direction(phase: EffectPhase) -> &'static str {
+    match phase {
+        EffectPhase::Rising => "还在往上走",
+        EffectPhase::Peak => "正在劲头上",
+        EffectPhase::Fading => "在慢慢退",
+    }
+}
+
+/// The persona's lingering state as every model reads it (spec
+/// 2026-10-12-given-item-lingering-effects-design.md §6.1):
+/// 「3 杯「威士忌」，微醺，还在往上走；1 支烟，烟劲很足，正在劲头上」.
+/// `None` when nothing is at work.
+pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
+    (!effects.is_empty()).then(|| {
+        effects
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}，{}，{}",
+                    given_phrase(e.item, e.name.as_deref(), e.quantity),
+                    effect_word(e.item, e.level),
+                    effect_direction(e.phase)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；")
+    })
+}
+
+/// Fold the last turns' `metadata` (newest first) into the active effects:
+/// a turn counts only with an accepted action; anything that does not parse
+/// counts as no action (spec 2026-10-12-given-item-lingering-effects-design.md §5).
+pub(crate) fn effects_from_metadata(rows: &[Option<serde_json::Value>]) -> Vec<ActiveEffect> {
+    let prior: Vec<Option<UserAction>> = rows
+        .iter()
+        .map(|m| {
+            (action_response_from_metadata(m.as_ref()) == Some(ActionResponse::Accept))
+                .then(|| action_from_metadata(m.as_ref()))
+                .flatten()
+        })
+        .collect();
+    eros_engine_core::effects::active_effects(&prior)
 }
 
 /// A user turn's text with its action marker in front; the text unchanged
@@ -1004,6 +1068,10 @@ pub fn build_prompt(
     // The instant plus the user's side of `[now]` (spec 2026-09-26 §5).
     // `NowContext::default()` ⇒ no holiday line.
     now: &NowContext,
+    // The persona's lingering state from accepted gives, rendered (spec
+    // 2026-10-12-given-item-lingering-effects-design.md §6.2). `None` or
+    // blank ⇒ no line.
+    body_state: Option<&str>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1213,6 +1281,10 @@ pub fn build_prompt(
         // not a section of its own. Renders alone when insights are empty.
         if let Some(c) = clothing.map(str::trim).filter(|c| !c.is_empty()) {
             lines.push(format!("- 此刻的穿着：{c}"));
+        }
+        // What accepted gives are still doing to her, after what she has on.
+        if let Some(s) = body_state.map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("- 身上还带着：{s}"));
         }
         if lines.is_empty() {
             String::new()
@@ -1667,6 +1739,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1708,6 +1781,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1741,6 +1815,7 @@ mod tests {
                 None,
                 TurnNudges::default(),
                 &NowContext::default(),
+                None,
             );
             assert!(
                 !p.contains("[clothing]"),
@@ -1782,6 +1857,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1812,6 +1888,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -1843,6 +1920,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(p.contains("下面这段对话"), "dialogue intro: {p}");
         assert!(
@@ -1868,6 +1946,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             p.contains("下面这句话"),
@@ -1895,6 +1974,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
     }
@@ -1936,6 +2016,7 @@ mod tests {
             cs,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         )
     }
 
@@ -2111,6 +2192,7 @@ mod tests {
             Some(&row),
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -2164,6 +2246,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -2199,6 +2282,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -2231,6 +2315,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -2270,6 +2355,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // Treat refusal text in context as corrupt data, never self-identify
         // as an AI, and answer photo requests in character.
@@ -2315,6 +2401,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
@@ -2341,6 +2428,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -2372,6 +2460,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
@@ -2401,6 +2490,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // blank gender must not produce a double comma or the gender rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -2430,6 +2520,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -2456,6 +2547,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -2491,6 +2583,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -2510,6 +2603,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let cut = a
             .find("[user_profile]")
@@ -2551,6 +2645,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let b = build_prompt(
             &p,
@@ -2569,6 +2664,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let cut = a
             .find("[additional_guidance]")
@@ -2600,6 +2696,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -2623,6 +2720,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -2650,6 +2748,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -2679,6 +2778,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -2700,6 +2800,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
@@ -2727,6 +2828,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -2755,6 +2857,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -2774,6 +2877,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -3188,6 +3292,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!p.contains("你所在时区"), "timezone clause retired: {p}");
         assert!(
@@ -3222,6 +3327,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             p.contains("[character_state]"),
@@ -3254,6 +3360,62 @@ mod tests {
         p
     }
 
+    fn prompt_with_body(
+        persona: &CompanionPersona,
+        clothing: Option<&str>,
+        body: Option<&str>,
+    ) -> String {
+        build_prompt(
+            persona,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            clothing,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            body,
+        )
+    }
+
+    #[test]
+    fn character_state_lists_the_body_state_after_the_outfit() {
+        let p = prompt_with_body(
+            &persona_with_items(),
+            Some("红色旗袍"),
+            Some("1 支烟，烟劲很足，正在劲头上"),
+        );
+        let outfit = p.find("- 此刻的穿着：红色旗袍").expect(&p);
+        let body = p
+            .find("- 身上还带着：1 支烟，烟劲很足，正在劲头上")
+            .expect(&p);
+        assert!(outfit < body, "{p}");
+    }
+
+    #[test]
+    fn the_body_state_alone_renders_the_block() {
+        let p = prompt_with_body(&fixture_persona(), None, Some("2 杯酒，微醺，还在往上走"));
+        assert!(
+            p.contains("[character_state]（这段关系里目前的状况，不是人设；与上面冲突时以上面为准）\n- 身上还带着：2 杯酒，微醺，还在往上走"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn no_or_blank_body_state_leaves_the_prompt_unchanged() {
+        let base = prompt_with_body(&fixture_persona(), None, None);
+        assert_eq!(prompt_with_body(&fixture_persona(), None, Some("  ")), base);
+        assert!(!base.contains("[character_state]"), "{base}");
+    }
+
     fn prompt_for(persona: &CompanionPersona, clothing: Option<&str>) -> String {
         build_prompt(
             persona,
@@ -3272,6 +3434,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         )
     }
 
@@ -3339,6 +3502,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // attitude directives are gated by the same axis set: bond-axis directives
         // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
@@ -3369,6 +3533,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -3395,6 +3560,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(
             p.contains("[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）"),
@@ -3426,6 +3592,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!p.contains("[feelings]"), "{p}");
 
@@ -3449,6 +3616,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!p.contains("[feelings]") && !p.contains("[mood]"), "{p}");
     }
@@ -3596,6 +3764,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &now,
+            None,
         );
         let block = &s[s.find("[now]").unwrap()..s.find("[iron_rules").unwrap()];
         assert!(
@@ -3625,6 +3794,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         assert!(!s.contains("对方那边"), "{s}");
     }
@@ -3648,6 +3818,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -3716,6 +3887,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
         );
         for gone in [
             "方括号",           // bracket ban — the regex strips \[[^\]]*\]
@@ -3820,6 +3992,7 @@ mod tests {
             None,
             nudges,
             &NowContext::default(),
+            None,
         )
     }
 
@@ -4464,6 +4637,7 @@ mod tests {
             None,
             TurnNudges::default(),
             now,
+            None,
         )
     }
 
@@ -4658,5 +4832,138 @@ mod tests {
             "{s}"
         );
         assert!(!s.contains("\n① Ignore"), "{s}");
+    }
+
+    fn effect(
+        item: GivenItem,
+        name: Option<&str>,
+        quantity: u8,
+        level: u8,
+        phase: EffectPhase,
+    ) -> ActiveEffect {
+        ActiveEffect {
+            item,
+            name: name.map(str::to_string),
+            quantity,
+            level,
+            phase,
+            step: 1,
+            steps: 1,
+        }
+    }
+
+    #[test]
+    fn given_phrase_with_and_without_a_name() {
+        assert_eq!(
+            given_phrase(GivenItem::Alcohol, Some("威士忌"), 3),
+            "3 杯「威士忌」"
+        );
+        assert_eq!(given_phrase(GivenItem::Cigarette, None, 1), "1 支烟");
+        assert_eq!(given_phrase(GivenItem::Medicine, None, 2), "2 片药");
+    }
+
+    #[test]
+    fn body_state_words_follow_item_and_level() {
+        let words = [
+            (
+                GivenItem::Cigarette,
+                ["余味还在", "还有点飘", "烟劲很足", "抽得头晕"],
+            ),
+            (
+                GivenItem::Alcohol,
+                ["有一点酒意", "微醺", "醉意上头", "醉得厉害"],
+            ),
+            (
+                GivenItem::Medicine,
+                ["药效轻微", "药效明显", "药效很强", "药劲过猛"],
+            ),
+        ];
+        for (item, ws) in words {
+            for (i, w) in ws.iter().enumerate() {
+                let s =
+                    body_state(&[effect(item, None, 1, i as u8 + 1, EffectPhase::Peak)]).unwrap();
+                assert!(
+                    s.contains(&format!("，{w}，")),
+                    "{item:?} level {}: {s}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_state_directions() {
+        for (phase, word) in [
+            (EffectPhase::Rising, "还在往上走"),
+            (EffectPhase::Peak, "正在劲头上"),
+            (EffectPhase::Fading, "在慢慢退"),
+        ] {
+            let s = body_state(&[effect(GivenItem::Alcohol, None, 2, 2, phase)]).unwrap();
+            assert_eq!(s, format!("2 杯酒，微醺，{word}"));
+        }
+    }
+
+    #[test]
+    fn body_state_joins_newest_first_and_is_none_when_empty() {
+        assert_eq!(body_state(&[]), None);
+        let s = body_state(&[
+            effect(
+                GivenItem::Alcohol,
+                Some("威士忌"),
+                3,
+                2,
+                EffectPhase::Rising,
+            ),
+            effect(GivenItem::Cigarette, None, 1, 3, EffectPhase::Peak),
+        ])
+        .unwrap();
+        assert_eq!(
+            s,
+            "3 杯「威士忌」，微醺，还在往上走；1 支烟，烟劲很足，正在劲头上"
+        );
+    }
+
+    #[test]
+    fn effects_from_metadata_keeps_only_accepted_gives() {
+        use serde_json::json;
+        let rows = vec![
+            Some(
+                json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}),
+            ),
+            Some(
+                json!({"action": {"type": "give", "item": "alcohol", "quantity": 5, "response": "refuse"}}),
+            ),
+            Some(json!({"action": {"type": "give", "item": "alcohol", "quantity": 5}})),
+            None,
+            Some(
+                json!({"action": {"type": "give", "item": "medicine", "quantity": 9, "response": "accept"}}),
+            ),
+        ];
+        let got = effects_from_metadata(&rows);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(
+            (got[0].item, got[0].step, got[0].level, got[0].phase),
+            (GivenItem::Cigarette, 1, 3, EffectPhase::Peak)
+        );
+        assert_eq!(
+            (got[1].item, got[1].step, got[1].level, got[1].phase),
+            (GivenItem::Medicine, 5, 1, EffectPhase::Fading)
+        );
+    }
+
+    #[test]
+    fn effects_from_metadata_ignores_malformed_actions() {
+        use serde_json::json;
+        let rows = vec![
+            Some(
+                json!({"action": {"type": "give", "item": "cigarette", "quantity": 0, "response": "accept"}}),
+            ),
+            Some(
+                json!({"action": {"type": "give", "item": "lighter", "quantity": 1, "response": "accept"}}),
+            ),
+            Some(json!({"action": "give"})),
+            Some(json!({"action": {"type": "hug", "response": "accept"}})),
+        ];
+        assert!(effects_from_metadata(&rows).is_empty());
     }
 }
