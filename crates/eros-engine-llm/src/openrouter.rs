@@ -526,6 +526,9 @@ pub struct UsageBlock {
 #[derive(Debug, Clone, Default)]
 pub struct DeltaChunk {
     pub content: Option<String>,
+    /// Reasoning text from this frame, when the model streams it. Callers
+    /// that render only `content` ignore it.
+    pub reasoning: Option<String>,
     pub finish_reason: Option<String>,
     pub usage: Option<UsageBlock>,
     pub generation_id: Option<String>,
@@ -558,6 +561,27 @@ impl futures_util::Stream for DeltaStream {
 struct WireStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// OpenRouter's normalised reasoning text. Kept as raw JSON so a provider
+    /// that sends another shape here (an object, an array) cannot fail the
+    /// frame; only a string value counts as reasoning.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    /// The same text under the DeepSeek-style key some direct endpoints use;
+    /// same string-only rule.
+    #[serde(default)]
+    reasoning_content: Option<serde_json::Value>,
+}
+
+/// The reasoning text of one delta: a non-empty string `reasoning` wins, else a
+/// non-empty string `reasoning_content`. Any other shape is not reasoning.
+fn delta_reasoning(delta: &WireStreamDelta) -> Option<String> {
+    let text = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    text(&delta.reasoning).or_else(|| text(&delta.reasoning_content))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1271,7 +1295,7 @@ impl OpenRouterClient {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
-            response_format: None,
+            response_format: req.response_format.as_ref(),
         }
         .for_endpoint(&ep);
 
@@ -1426,8 +1450,10 @@ impl OpenRouterClient {
                                         ),
                                     )));
                                 }
+                                let reasoning = delta_reasoning(&choice.delta);
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
+                                    reasoning,
                                     finish_reason: choice.finish_reason,
                                     usage: frame.usage,
                                     // A BYOK hop keeps the id minted above.
@@ -2654,6 +2680,146 @@ data: [DONE]\n\n";
         assert_eq!(u.total_tokens, 5);
         assert_eq!(last_gen_id.as_deref(), Some("gen-xyz"));
         assert_eq!(last_model.as_deref(), Some("x-ai/grok-4-fast"));
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_reasoning_deltas() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        // reasoning, then the DeepSeek-style key, then a frame carrying both
+        // (reasoning wins), then an empty `reasoning` beside a non-empty
+        // `reasoning_content` (the empty key must not shadow it), then content.
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"先想\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"再想\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"两个\",\"reasoning_content\":\"都在\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"\",\"reasoning_content\":\"补上\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"\",\"content\":\"{}\"}}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens");
+        let mut reasoning = Vec::new();
+        let mut content = Vec::new();
+        while let Some(item) = stream.next().await {
+            let c = item.expect("chunk parses");
+            if let Some(r) = c.reasoning {
+                reasoning.push(r);
+            }
+            if let Some(t) = c.content {
+                content.push(t);
+            }
+        }
+        assert_eq!(reasoning, vec!["先想", "再想", "两个", "补上"]);
+        assert_eq!(content, vec!["{}"]);
+    }
+
+    #[tokio::test]
+    async fn execute_stream_ignores_non_string_reasoning() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"reasoning\":{\"text\":\"x\"},\"content\":\"ok\"}}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens");
+        let mut reasoning = Vec::new();
+        let mut content = Vec::new();
+        while let Some(item) = stream.next().await {
+            let c = item.expect("an object-shaped reasoning still parses");
+            reasoning.extend(c.reasoning);
+            content.extend(c.content);
+        }
+        assert!(reasoning.is_empty(), "{reasoning:?}");
+        assert_eq!(content, vec!["ok"]);
+    }
+
+    #[tokio::test]
+    async fn execute_stream_sends_response_format() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "stream": true,
+                "response_format": {"type": "json_object"}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 16,
+                response_format: Some(serde_json::json!({"type": "json_object"})),
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens — a missing response_format would 404 the matcher");
+        while stream.next().await.is_some() {}
     }
 
     #[tokio::test]

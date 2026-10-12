@@ -1222,6 +1222,449 @@
         ]
       }
     },
+    "/v2/comp/group": {
+      "post": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "create_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`session_not_found`: a member session is unknown or not the caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_title`, or `unprocessable` for an empty member list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/group/{group_id}": {
+      "get": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "get_group",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "archive_group",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "rename_group",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_title`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/group/{group_id}/members": {
+      "post": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "add_member",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMemberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`group_not_found`, or `session_not_found` for the member session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/group/{group_id}/members/{member_session_id}": {
+      "delete": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "remove_member",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "member_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "`group_not_found`, or `member_not_found` when the session is not a member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/group/{group_id}/message/stream": {
+      "post": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "send_group_message_stream",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE: director_reasoning* → cast → (meta → delta* → done → image_request? | meta → done{truncated:true} → speaker_error | speaker_error)×N → final. A failed speaker emits `meta → done{truncated:true}` for each attempt and then `speaker_error` when its chain is exhausted, or a bare `speaker_error` when its request could not be built or its image row could not be persisted. A terminal `error` can replace anything after the first frame.",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/groups": {
+      "get": {
+        "tags": [
+          "group"
+        ],
+        "operationId": "list_groups",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupListResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/instance/{instance_id}/insight/character": {
       "get": {
         "tags": [
@@ -2157,6 +2600,18 @@
           }
         }
       },
+      "AddMemberRequest": {
+        "type": "object",
+        "required": [
+          "member_session_id"
+        ],
+        "properties": {
+          "member_session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "AffinityDeltasDto": {
         "type": "object",
         "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
@@ -2567,6 +3022,14 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "speaker_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The member session that spoke this line (group sessions only)."
           },
           "user_message_id": {
             "type": [
@@ -3103,6 +3566,14 @@
             "type": "string",
             "format": "date-time"
           },
+          "speaker_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The member session that spoke this line (group sessions only)."
+          },
           "user_message_id": {
             "type": [
               "string",
@@ -3202,6 +3673,29 @@
         "properties": {
           "content": {
             "type": "string"
+          }
+        }
+      },
+      "CreateGroupRequest": {
+        "type": "object",
+        "required": [
+          "member_session_ids"
+        ],
+        "properties": {
+          "member_session_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "1..=3 of the caller's own 1:1 text sessions, in join order."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64
           }
         }
       },
@@ -3420,6 +3914,161 @@
           "returning",
           "just_opened"
         ]
+      },
+      "GroupDto": {
+        "type": "object",
+        "required": [
+          "group_id",
+          "members",
+          "created_at",
+          "last_active_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_active_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GroupMemberDto"
+            }
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "GroupListResponse": {
+        "type": "object",
+        "required": [
+          "groups"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GroupDto"
+            }
+          }
+        }
+      },
+      "GroupMemberDto": {
+        "type": "object",
+        "required": [
+          "member_session_id",
+          "instance_id",
+          "joined_at"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "joined_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "member_session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "GroupSendRequest": {
+        "type": "object",
+        "required": [
+          "content",
+          "client_msg_id"
+        ],
+        "properties": {
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto",
+                "description": "The 1:1 OpenRouter audit passthrough, with the same caps; it rides\neach speaker's reply call."
+              }
+            ]
+          },
+          "byok": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Refused: group turns run on the deployment's key only."
+          },
+          "client_msg_id": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "image": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageReplyParams"
+              }
+            ]
+          },
+          "mentions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Member sessions the user @-mentioned; each must be seated."
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "HealthResponse": {
         "type": "object",
@@ -4177,6 +4826,19 @@
           }
         }
       },
+      "RenameGroupRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears the title.",
+            "maxLength": 64
+          }
+        }
+      },
       "SessionListEntry": {
         "type": "object",
         "required": [
@@ -4732,6 +5394,10 @@
     {
       "name": "bff-companion",
       "description": "Frontend-shaped mirror of /comp/* for first-party clients; shape may diverge from canonical without notice"
+    },
+    {
+      "name": "group",
+      "description": "Group chat: the user and up to three personas, each an existing 1:1 session"
     }
   ]
 }

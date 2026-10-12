@@ -119,6 +119,8 @@ Frame fields worth noting:
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
 - **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
+- **`speaker_session_id`** (on `meta`, group turns only) — the member session that speaks this message; omitted on 1:1 turns, so 1:1 frames are unchanged.
+- **`cast`**, **`director_reasoning`**, **`speaker_error`** — group turns only; see [group-chat.md](group-chat.md#one-turn). A 1:1 stream never emits them.
 - **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay. Clients must tolerate frame types they do not know. A turn that then ends in `error` did not take effect, and history carries no `response` for it.
 - **`body_state`** — on a turn where an accepted `give` is still at work: `user_message_id` and `effects`, newest give first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`). It describes the state this turn's reply was written with. Sent once, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay. Absent when nothing is at work.
 
@@ -758,7 +760,7 @@ persisted instruction message.
 | 401 | missing or invalid bearer |
 | 403 | not your session |
 | 404 | unknown session, or no such message in it |
-| **409** | the message exists but is not an image turn |
+| **409** | the message exists but is not an image turn; or the session is a group session (`message` contains `wrong_channel`) |
 | 422 | blank `instruction`, or unsupported `aspect_ratio` |
 | 501 | neither `[tasks.chat_image_edit_compose]` nor `[tasks.chat_image_prompt_compose]` is configured |
 | 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
@@ -886,7 +888,8 @@ reactions set since the user's previous message on the next text reply turn;
 a reaction never triggers a reply and never moves affinity.
 
 Errors: `400` (not exactly one standard emoji, or not allowed), `403` (not your
-session), `404` (session or message not found), `409` (not an assistant message).
+session), `404` (session or message not found), `409` (not an assistant message;
+or a group session, with a `message` containing `wrong_channel`).
 
 ### `DELETE /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -942,6 +945,8 @@ session.
 with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
 
 `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`.
+
+`speaker_session_id` (assistant rows of a group session only, omitted otherwise) is the member session that spoke the line; resolve a departed speaker's name through session, then instance.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -1008,6 +1013,65 @@ rows that stay unstamped.
 row stay unstamped permanently.
 
 See [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md).
+
+## Group chat
+
+A group is a chat session with `channel = 'group'`, no persona instance, and up to
+three members, each an existing 1:1 text session of the caller. Every route below
+requires the JWT user to own the group; any other group id is
+`404 group_not_found`. The turn, the director and the frames are described in
+[group-chat.md](group-chat.md).
+
+| Method | Path | Body / effect |
+|---|---|---|
+| `POST` | `/v2/comp/group` | `{title?, member_session_ids: [1..=3]}` → group DTO |
+| `GET` | `/v2/comp/groups` | `{groups: [...]}`: the caller's non-archived groups, newest `last_active_at` first |
+| `GET` | `/v2/comp/group/{group_id}` | group DTO |
+| `PATCH` | `/v2/comp/group/{group_id}` | `{title}`; `null` clears. `200` group DTO |
+| `POST` | `/v2/comp/group/{group_id}/members` | `{member_session_id}` → `200` group DTO |
+| `DELETE` | `/v2/comp/group/{group_id}/members/{member_session_id}` | kick; `204` |
+| `DELETE` | `/v2/comp/group/{group_id}` | dissolve (`archived = true`); `204` |
+| `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE turn, see [group-chat.md](group-chat.md#send) |
+
+Group DTO: `group_id`, `title` (nullable), `members[]` (`member_session_id`,
+`instance_id`, `joined_at`), `created_at`, `last_active_at`.
+
+A title is trimmed and must be 1 to 64 characters with no control character;
+otherwise `422 invalid_title`.
+
+Every refusal below carries the pre-stream body `{code, message, user_message}`
+(plus `original_user_message_id` on the two `duplicate_*` codes).
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_payload` | send: malformed `client_msg_id`, `tier`, `prompt_traits` or `audit`; a `byok` block; `image.force = true` |
+| 404 | `group_not_found` | the group is unknown, dissolved or not the caller's |
+| 404 | `session_not_found` | create / add member: a member session is unknown or not the caller's |
+| 404 | `member_not_found` | kick: the session is not a member of the group |
+| 409 | `group_full` | the group already has three members |
+| 409 | `wrong_channel` | member session is not a text session; on send, the session is not a group |
+| 409 | `session_archived` | member session is archived |
+| 409 | `instance_already_member` | another member has the same persona instance |
+| 409 | `group_empty` | send to a group with no member |
+| 409 | `duplicate_in_progress` | send: the same `client_msg_id` is still running |
+| 409 | `duplicate_failed` | send: that `client_msg_id`'s turn failed terminally; send a fresh one |
+| 422 | `invalid_title` | blank, over-long or control-character title |
+| 422 | `unprocessable` | create with an empty member list; send with blank or over-long `content`, an unsupported `image.aspect_ratio`, or a mention that is not a member |
+| 429 | `rate_limited` | send: the per-user in-flight stream cap is reached |
+
+The send body takes the 1:1 `audit` block, which rides each speaker's reply
+call. A failed speaker emits `meta → done{truncated:true}` for each attempt and
+then `speaker_error` when its chat chain is exhausted, or a bare
+`speaker_error` when its reply request could not be built or its image row
+could not be persisted. A turn that hits the generation timeout runs no
+post-process. A resend of a running turn's `client_msg_id` is
+`409 duplicate_in_progress`; after it settles, the resend replays the persisted
+rows (see [group-chat.md](group-chat.md#send)).
+
+Reused unchanged on a group session id: `GET /comp/chat/{session_id}/history`,
+`GET /bff/v1/comp/chat/{session_id}/history` (including its cursors),
+`POST /comp/chat/{session_id}/read` and
+`GET /comp/chat/{session_id}/messages/{message_id}/image-request`.
 
 ## Voice
 
@@ -1350,7 +1414,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`.
+All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`. Group sessions are not listed; they come from `GET /v2/comp/groups`.
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -1636,7 +1700,8 @@ route above, including the "404 on a flagged row = unrecoverable" reading.
 The `POST /bff/v1/comp/chat/start` bundle serializes history through this
 same entry shape and therefore carries the flag too. `user_message_id` names the
 `role='user'` row whose turn produced this row — present on assistant rows and
-on `system_error` notices, omitted on user rows. `reply_to_message_id`
+on `system_error` notices, omitted on user rows. `speaker_session_id` marks the
+speaker of a group-session assistant row and is omitted everywhere else. `reply_to_message_id`
 echoes the quote a `user` row was sent with (see the stream route's
 **Optional: quote** section) — the id of the row it quoted, always in this same
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
@@ -1848,7 +1913,8 @@ failure modes on all three routes use the `code` / `message` /
 `"error"` key. `POST /comp/voice/{session_id}/turn/interrupt` shares that
 same error body shape even though it is not itself a stream (its success
 response is plain JSON) — it reuses the voice turn's precondition checks and
-error type. The table below covers the plain shape:
+error type. The group routes (`/v2/comp/group*`) use the coded shape for their
+refusals too. The table below covers the plain shape:
 
 | Status | Code | When |
 |--------|------|------|
@@ -1856,6 +1922,7 @@ error type. The table below covers the plain shape:
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
 | 404 | `not_found` | Unknown session / persona / message id |
+| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
 | *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
 
@@ -1866,6 +1933,7 @@ error type. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives (`v2/comp/session/{session_id}/effects`)
+- `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
