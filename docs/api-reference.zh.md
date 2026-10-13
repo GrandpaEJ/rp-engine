@@ -10,7 +10,7 @@
 
 每個 `/comp/*` 跟 `/bff/v1/*` 端點都需要 `Authorization: Bearer <Supabase JWT>`。用 token 的 `alg` 头选校验器：非对称签名（ES256/RS256/EdDSA）走项目的 JWKS 校验，地址取自 `SUPABASE_JWKS_URL`，或由 `SUPABASE_URL` 推导——自 Supabase 2025 年 JWT Signing Keys 上线后这是默认路径。尚未迁移的部署仍可用旧的 HS256 + 共享密钥 `SUPABASE_JWT_SECRET`；两个来源至少要配一个，否则服务器拒绝启动。`sub` claim 必須是個 UUID；該 UUID 即該請求的 user_id。
 
-`/healthz` 跟 `/docs` 是公開的。
+`/healthz` 跟 `/docs` 是公開的。`/svc/v1/*` 是第三類：以共享 secret header 放行，從不認 bearer token——見[服務端點](#服務端點)。
 
 ## 公開端點
 
@@ -1628,6 +1628,24 @@ session 403）。
 - 单个 session 不会有 403/404：响应里只可能出现调用者自己的行，别人的或不存在
   的 session 就是不出现。
 
+## 服務端點
+
+`/svc/v1/*` 下是服務間路由。以共享 secret header 放行而非用戶 JWT，而且除非部署配置了該 secret，整棵子樹**不會掛載**——未配置的部署對該路徑的回應與任何未知路徑一致：不會是 `403`，也不會是 `200`。
+
+### `GET /svc/v1/insights/changes`
+
+自某個 keyset 游標以來有變動的 `human_insights` 行，給維護對話推導畫像只讀鏡像的下游服務用。需要 `x-insights-export-secret: <INSIGHTS_EXPORT_SECRET>`（缺失或錯誤回 403）。讀的是活表，不是快照歸檔。
+
+| Query | 默認 | 含義 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339；嚴格晚於 `(since, after_user)` 的行 |
+| `after_user` | nil UUID | `since` 內的 tie-break——傳 `next.user_id` |
+| `limit` | 500 | 夾在 1..=1000 |
+
+行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；同一次遍歷內，把它的兩個字段原樣傳回 `since` 與 `after_user`——保留微秒精度、URL 編碼——`next` 為 `null` 即結束。截斷時間戳的客戶端（JavaScript `Date` 只到毫秒）在 1000 行共享同一個 `now()` 時會無限重取同一頁。
+
+**下一次輪詢從哪裡開始。** 記住收到的最後一行的 `(updated_at, user_id)` 作為續點；空頁則沿用上一個。每次新輪詢從它*往前*幾秒開始：`since = last.updated_at − 5s`，不傳 `after_user`。`updated_at` 在寫入開始時打上，但行要到提交才可見，晚提交的行可能帶著你已經走過的時間戳；重疊窗口把它撿回來。重複回來的行無害——每行都是該用戶當前的畫像，以 `user_id` 為鍵。只傳 `since` 會刻意把恰好在該時刻的行再回一次（nil UUID 排在所有真實 UUID 之前）。
+
 ## 錯誤響應
 
 大多数错误是 JSON 形状 `{"error": "<code>", "message": "<人类可读>"}`。
@@ -1644,7 +1662,7 @@ session 403）。
 |--------|------|------|
 | 400 | `bad_request` | 請求體格式錯、UUID 無效、缺必填字段 |
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
-| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
+| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 上 `x-insights-export-secret` 缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
@@ -1666,5 +1684,6 @@ session 403）。
 - `crates/eros-engine-server/src/routes/world_town.rs`——World Town 信息流与评论（`/world/town/*`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
+- `crates/eros-engine-server/src/routes/svc.rs`——服務間導出（`/svc/v1/*`）
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
 - `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

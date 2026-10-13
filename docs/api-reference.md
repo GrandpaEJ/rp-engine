@@ -10,7 +10,7 @@ This page is a hand-written summary of the endpoints worth knowing. The Scalar U
 
 Every `/comp/*` and `/bff/v1/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The token's `alg` header selects the validator: asymmetric signatures (ES256/RS256/EdDSA) are checked against the project's JWKS, resolved from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL` — this is the default for Supabase projects since the 2025 JWT Signing Keys rollout. Legacy HS256 against a shared `SUPABASE_JWT_SECRET` is still accepted for deployments that have not migrated; at least one of the two sources must be configured or the server fails to boot. The `sub` claim must be a UUID; that becomes the user_id for the request.
 
-`/healthz` and `/docs` are public.
+`/healthz` and `/docs` are public. `/svc/v1/*` is a third class: admitted by a shared secret header, never by a bearer token — see [Service endpoints](#service-endpoints).
 
 ## Public endpoints
 
@@ -1911,6 +1911,48 @@ form of the route above, for a client rendering one row per companion. The
 - No per-session 403/404: the response only ever contains rows the caller owns,
   so a foreign or unknown session is simply absent.
 
+## Service endpoints
+
+Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT, and the whole sub-tree is **not mounted** unless the deployment configured the secret — an unconfigured deployment answers exactly as it does for any unknown path: never `403`, never `200`.
+
+### `GET /svc/v1/insights/changes`
+
+`human_insights` rows changed since a keyset cursor, for a downstream service that mirrors the conversation-derived profile. Requires `x-insights-export-secret: <INSIGHTS_EXPORT_SECRET>` (403 when missing or wrong). Reads the live table, not the snapshot archive.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 timestamp; rows strictly after `(since, after_user)` |
+| `after_user` | nil UUID | tie-break within `since` — pass `next.user_id` |
+| `limit` | 500 | clamped to 1..=1000 |
+
+```bash
+curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/insights/changes?limit=1"
+```
+
+```json
+{
+  "profiles": [
+    {
+      "user_id": "8d1f…",
+      "city": "Singapore", "location": null, "hometown": null, "nationality": null,
+      "occupation": null, "mbti_guess": null, "love_values": null,
+      "emotional_needs": null, "life_rhythm": null,
+      "interests": ["jazz", "hiking"], "personality_traits": ["calm"],
+      "preferred_gender": null, "age_min": 25, "age_max": 35, "deal_breakers": ["smoking"],
+      "education": null, "family": null, "relationship_history": null,
+      "social_pattern": null, "future_plans": null, "finance_status": null,
+      "updated_at": "2026-10-13T12:00:00Z"
+    }
+  ],
+  "next": { "updated_at": "2026-10-13T12:00:00Z", "user_id": "8d1f…" }
+}
+```
+
+Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is full; within one walk, pass both of its fields back verbatim as `since` and `after_user` — at full microsecond precision, URL-encoded — and stop when `next` is `null`. A client that truncates the timestamp (JavaScript `Date` keeps milliseconds) can re-fetch the same full page forever once 1000 rows share one `now()`.
+
+**Resuming the next poll.** Keep the last row you received — its `(updated_at, user_id)` — as your resume point; on an empty page keep the previous one. Start each new poll a few seconds *before* it: `since = last.updated_at − 5s`, no `after_user`. `updated_at` is stamped when the write starts, but the row is visible only when it commits, so a late-committing row can carry a timestamp you have already walked past; the overlap window picks it up. Re-returned rows are harmless — each is the user's current profile, keyed by `user_id`. Passing `since` alone deliberately re-returns rows at exactly that timestamp (the nil UUID sorts below every real one).
+
 ## Error responses
 
 Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.
@@ -1929,7 +1971,7 @@ refusals too. The table below covers the plain shape:
 |--------|------|------|
 | 400 | `bad_request` | Malformed body, invalid UUID, missing required field |
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
-| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
+| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or `x-insights-export-secret` missing or wrong on `/svc/v1/*` |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
@@ -1951,5 +1993,6 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/world_town.rs` — World Town feed and comments (`/world/town/*`)
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
+- `crates/eros-engine-server/src/routes/svc.rs` — service-to-service export (`/svc/v1/*`)
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata
