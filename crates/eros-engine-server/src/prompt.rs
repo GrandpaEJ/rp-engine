@@ -801,6 +801,28 @@ pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
     })
 }
 
+/// The persona's needs as the reply reads them (spec
+/// 2026-10-13-persona-needs-design.md §6.2): the levels that are not `mid`,
+/// in the order hunger, social, stamina, emotional, joined by 「；」. `None`
+/// when all four are `mid`.
+pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
+    use eros_engine_core::needs::NeedLevel;
+    let words: Vec<&str> = [
+        (n.hunger, "不饿", "饿了"),
+        (n.social, "不想跟人打交道", "想找人说说话"),
+        (n.stamina, "很累", "精神很好"),
+        (n.emotional, "心里挺满足", "很想被在乎"),
+    ]
+    .into_iter()
+    .filter_map(|(level, low, high)| match level {
+        NeedLevel::Low => Some(low),
+        NeedLevel::Mid => None,
+        NeedLevel::High => Some(high),
+    })
+    .collect();
+    (!words.is_empty()).then(|| words.join("；"))
+}
+
 /// Fold the last turns' `metadata` (newest first) into the active effects:
 /// a turn counts only with an accepted action; anything that does not parse
 /// counts as no action (spec 2026-10-12-given-item-lingering-effects-design.md §5).
@@ -1107,6 +1129,10 @@ pub fn build_prompt(
     // 2026-10-12-given-item-lingering-effects-design.md §6.2). `None` or
     // blank ⇒ no line.
     body_state: Option<&str>,
+    // The persona's needs that are not at `mid`, rendered by `needs_line`
+    // (spec 2026-10-13-persona-needs-design.md §6.2). `None` or blank ⇒ no
+    // line.
+    needs: Option<&str>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1320,6 +1346,10 @@ pub fn build_prompt(
         // What accepted gives are still doing to her, after what she has on.
         if let Some(s) = body_state.map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- 身上还带着：{s}"));
+        }
+        // The persona's needs, after what she is still feeling.
+        if let Some(s) = needs.map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("- 此刻的需要：{s}"));
         }
         if lines.is_empty() {
             String::new()
@@ -1775,6 +1805,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1817,6 +1848,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1850,6 +1882,7 @@ mod tests {
                 None,
                 TurnNudges::default(),
                 &NowContext::default(),
+                None,
                 None,
             );
             assert!(
@@ -1893,6 +1926,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1923,6 +1957,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(
@@ -1956,6 +1991,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(p.contains("下面这段对话"), "dialogue intro: {p}");
         assert!(
@@ -1981,6 +2017,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(
@@ -2009,6 +2046,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
@@ -2051,6 +2089,7 @@ mod tests {
             cs,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         )
     }
@@ -2228,6 +2267,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -2282,6 +2322,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -2318,6 +2359,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -2350,6 +2392,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         // Guard present, sits before identity (stable prefix).
@@ -2390,6 +2433,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         // Treat refusal text in context as corrupt data, never self-identify
@@ -2437,6 +2481,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
@@ -2463,6 +2508,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(
@@ -2496,6 +2542,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
@@ -2525,6 +2572,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         // blank gender must not produce a double comma or the gender rule
@@ -2556,6 +2604,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -2582,6 +2631,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         let z = s.find("⓪").expect("⓪ rule must render");
@@ -2619,6 +2669,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -2638,6 +2689,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         let cut = a
@@ -2681,6 +2733,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         let b = build_prompt(
             &p,
@@ -2699,6 +2752,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         let cut = a
@@ -2732,6 +2786,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -2755,6 +2810,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
@@ -2783,6 +2839,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         let block_at = p.find("[world_memories]").expect("block present");
@@ -2814,6 +2871,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -2835,6 +2893,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
@@ -2863,6 +2922,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         let at = p.find("[world_stories]").expect("block present");
@@ -2893,6 +2953,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -2912,6 +2973,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
@@ -3328,6 +3390,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!p.contains("你所在时区"), "timezone clause retired: {p}");
         assert!(
@@ -3362,6 +3425,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(
@@ -3418,6 +3482,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             body,
+            None,
         )
     }
 
@@ -3451,6 +3516,82 @@ mod tests {
         assert!(!base.contains("[character_state]"), "{base}");
     }
 
+    fn prompt_with_needs(body: Option<&str>, needs: Option<&str>) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            body,
+            needs,
+        )
+    }
+
+    #[test]
+    fn needs_line_words_and_order() {
+        use eros_engine_core::needs::{NeedLevel::*, Needs};
+        let all = |l| Needs {
+            hunger: l,
+            social: l,
+            stamina: l,
+            emotional: l,
+        };
+        assert_eq!(needs_line(&all(Mid)), None);
+        assert_eq!(
+            needs_line(&all(Low)).as_deref(),
+            Some("不饿；不想跟人打交道；很累；心里挺满足")
+        );
+        assert_eq!(
+            needs_line(&all(High)).as_deref(),
+            Some("饿了；想找人说说话；精神很好；很想被在乎")
+        );
+        let mixed = Needs {
+            hunger: High,
+            social: Mid,
+            stamina: Low,
+            emotional: Mid,
+        };
+        assert_eq!(needs_line(&mixed).as_deref(), Some("饿了；很累"));
+    }
+
+    #[test]
+    fn character_state_lists_the_needs_after_the_body_state() {
+        let p = prompt_with_needs(Some("1 支烟，烟劲很足，正在劲头上"), Some("饿了；很累"));
+        let body = p
+            .find("- 身上还带着：1 支烟，烟劲很足，正在劲头上")
+            .expect(&p);
+        let needs = p.find("- 此刻的需要：饿了；很累").expect(&p);
+        assert!(body < needs, "{p}");
+    }
+
+    #[test]
+    fn the_needs_alone_render_the_block() {
+        let p = prompt_with_needs(None, Some("饿了"));
+        assert!(
+            p.contains("[character_state]（这段关系里目前的状况，不是人设；与上面冲突时以上面为准）\n- 此刻的需要：饿了"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn no_or_blank_needs_leave_the_prompt_unchanged() {
+        let base = prompt_with_needs(None, None);
+        assert_eq!(prompt_with_needs(None, Some("  ")), base);
+        assert!(!base.contains("[character_state]"), "{base}");
+    }
+
     fn prompt_for(persona: &CompanionPersona, clothing: Option<&str>) -> String {
         build_prompt(
             persona,
@@ -3469,6 +3610,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         )
     }
@@ -3538,6 +3680,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         // attitude directives are gated by the same axis set: bond-axis directives
         // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
@@ -3569,6 +3712,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -3595,6 +3739,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(
@@ -3628,6 +3773,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!p.contains("[feelings]"), "{p}");
 
@@ -3651,6 +3797,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         assert!(!p.contains("[feelings]") && !p.contains("[mood]"), "{p}");
@@ -3800,6 +3947,7 @@ mod tests {
             TurnNudges::default(),
             &now,
             None,
+            None,
         );
         let block = &s[s.find("[now]").unwrap()..s.find("[iron_rules").unwrap()];
         assert!(
@@ -3830,6 +3978,7 @@ mod tests {
             TurnNudges::default(),
             &NowContext::default(),
             None,
+            None,
         );
         assert!(!s.contains("对方那边"), "{s}");
     }
@@ -3853,6 +4002,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         // What survives of the old ⑨: the half that governs what the reply
@@ -3922,6 +4072,7 @@ mod tests {
             None,
             TurnNudges::default(),
             &NowContext::default(),
+            None,
             None,
         );
         for gone in [
@@ -4027,6 +4178,7 @@ mod tests {
             None,
             nudges,
             &NowContext::default(),
+            None,
             None,
         )
     }
@@ -4672,6 +4824,7 @@ mod tests {
             None,
             TurnNudges::default(),
             now,
+            None,
             None,
         )
     }

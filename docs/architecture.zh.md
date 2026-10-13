@@ -164,6 +164,7 @@ crates/
 │       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── group.rs          # 群聊导演输出规整、兜底点名、转录角色映射
+│       ├── needs.rs          # 角色的四项需求（档位 + 按时间推算）
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
@@ -174,7 +175,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0069_human_insights_updated_idx
+│   ├── migrations/           # 0000_schema → 0070_chat_messages_needs_idx
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo

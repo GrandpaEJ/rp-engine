@@ -174,6 +174,7 @@ crates/
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── group.rs          # group director normalization, fallback cast, transcript roles
+│       ├── needs.rs          # the persona's four needs (levels + time carry-forward)
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
@@ -184,7 +185,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0069_human_insights_updated_idx
+│   ├── migrations/           # 0000_schema → 0070_chat_messages_needs_idx
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
