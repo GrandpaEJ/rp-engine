@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A persona-initiated assistant message: the holiday greeting and the
-//! caller-named openers. The route (`routes::session_open`) decides whether
-//! the persona speaks first; this module generates and persists it. Modelled
-//! on the image-edit text half: no PDE, no streaming, no user row, no
+//! A persona-initiated assistant message: the holiday and birthday greetings,
+//! the caller-named openers and the life events. The route
+//! (`routes::session_open`, `routes::session_events`) decides whether the
+//! persona speaks first; this module generates and persists it. Modelled on
+//! the image-edit text half: no PDE, no streaming, no user row, no
 //! post-process.
 //!
+//! A greeting or opener is checked against its `since` cutoff and yields to
+//! any message that landed at or after it. An event is written at the moment its message
+//! is generated, its `ends_at` counted from that instant, and it does not
+//! yield to user messages or openers; only an event already under way for the
+//! persona, or one with the same key in the session, blocks it.
+//!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
-//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6
+//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
+//! docs/superpowers/specs/2026-10-13-life-events-design.md §5
 
 use chrono::{DateTime, NaiveDate, Utc};
+use eros_engine_core::events::{self, EventKind};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -60,6 +69,12 @@ pub(crate) enum Occasion {
     JustOpened {
         open_key: String,
     },
+    /// A life event the persona tells about (spec
+    /// 2026-10-13-life-events-design.md §5.2); the caller's key.
+    Event {
+        event_key: String,
+        kind: EventKind,
+    },
 }
 
 impl Occasion {
@@ -71,6 +86,7 @@ impl Occasion {
             Self::FirstMeet { .. } => "first_meet",
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
+            Self::Event { .. } => "event",
         }
     }
 
@@ -85,7 +101,19 @@ impl Occasion {
             Self::Returning { gap_days, .. } => {
                 format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
             }
+            Self::Event { kind, .. } => event_cue(*kind).into(),
         }
+    }
+}
+
+/// The stage cue for a life event: states a fact, carries no instruction.
+fn event_cue(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::TempWork => "（你刚临时接到一份工作，得马上去处理。）",
+        EventKind::ExMessage => "（你的前任刚给你发来消息。）",
+        EventKind::WeatherChange => "（你那边的天气刚刚突然变了。）",
+        EventKind::PoliceEncounter => "（你刚在外面被警察拦下来问话。）",
+        EventKind::AnimalEncounter => "（你刚在路上遇到了一只小动物。）",
     }
 }
 
@@ -104,7 +132,8 @@ pub(crate) struct Greeting<'a> {
     /// The cutoff `greet`'s insert re-checks atomically: no message other
     /// than a dated greeting may have landed at or after it. The local
     /// midnight for a holiday (user clock) or a birthday (persona clock); the
-    /// request's start for an opener.
+    /// request's start for an opener. An event does not read it: it is
+    /// written at the instant its message is generated.
     pub since: DateTime<Utc>,
     pub tier: Option<String>,
     pub prompt_traits: Vec<PromptTrait>,
@@ -115,9 +144,12 @@ pub(crate) struct Greeting<'a> {
 }
 
 /// Generate and persist the message. `Ok(None)`: the model returned a blank
-/// reply and nothing was written, or the insert yielded to a message that
-/// landed first. When a concurrent call for the same local date or
-/// `open_key` won the insert, returns that call's row.
+/// reply and nothing was written; or, for a greeting or opener, the insert
+/// yielded to a message that landed first; or, for an event, another event
+/// under way for the persona blocked the insert. When a concurrent call for
+/// the same local date, `open_key` or `event_key` won the insert, returns
+/// that call's row. An event is stamped with one instant taken after
+/// generation: its row's `sent_at` and the start of its `ends_at` span.
 pub(crate) async fn greet(
     state: &AppState,
     g: Greeting<'_>,
@@ -174,6 +206,7 @@ pub(crate) async fn greet(
         false,
         None,
         None,
+        None,
     )
     .await?;
     chat_req.messages.push(WireMessage {
@@ -228,6 +261,8 @@ pub(crate) async fn greet(
     }
     let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
+    // An event is written when its message is, not when the request began.
+    let event_at = Utc::now();
     let mut metadata = g.metadata;
     metadata.insert("proactive".into(), g.occasion.name().into());
     match &g.occasion {
@@ -247,6 +282,14 @@ pub(crate) async fn greet(
         }
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
+        }
+        Occasion::Event { event_key, kind } => {
+            let ends_at = event_at + events::duration(*kind);
+            metadata.insert("event_key".into(), event_key.as_str().into());
+            metadata.insert(
+                "event".into(),
+                serde_json::json!({"kind": kind.as_str(), "ends_at": ends_at.to_rfc3339()}),
+            );
         }
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
@@ -292,5 +335,12 @@ pub(crate) async fn greet(
                 None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
             }
         }
+        Occasion::Event { event_key, .. } => match chat_repo
+            .insert_event_message(g.instance_id, g.session_id, event_at, &row)
+            .await?
+        {
+            Some(written) => Ok(Some(written)),
+            None => Ok(chat_repo.event_message(g.session_id, event_key).await?),
+        },
     }
 }

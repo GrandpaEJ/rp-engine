@@ -134,9 +134,11 @@ After validation and `resolve_text_turn` (`404 session_not_found`,
    sessions. `draw` with `thread_rng`. `None` → `{"event": null,
    "message": null}`, no model call.
 3. **Generate** under the per-user in-flight cap every LLM entry point uses
-   (429 when reached). `greet` with a new `Occasion::Event { event_key, kind,
-   ends_at }`: its cue is the kind's cue, and the recall query is the latest
-   user row's `recall_query_text`, as for `just_opened`. A failed generation
+   (429 when reached). `greet` with a new `Occasion::Event { event_key, kind
+   }`: its cue is the kind's cue, and the recall query is the latest
+   user row's `recall_query_text`, as for `just_opened`. The event's time is
+   one instant taken after generation: it is the row's `sent_at`, and
+   `ends_at` is that instant plus the kind's duration. A failed generation
    returns the upstream error and writes nothing. A blank reply, or one
    `output_regex` strips to empty, writes nothing and returns nulls.
 4. **Persist** atomically (§5.4).
@@ -168,13 +170,13 @@ The row has the shape of an opener: `role = 'assistant'`,
 
 - `proactive`: `"event"`;
 - `event`: `{"kind": "…", "ends_at": "…"}`. `ends_at` is stored because it is
-  fixed when the event is drawn, and a later change to a kind's duration must
+  fixed when the event is written, and a later change to a kind's duration must
   not move past events;
 - `event_key`;
 - `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`,
   `memory_scope`, `affinity_scope`, as an opener's row carries them.
 
-`ChatRepo::insert_event_message(instance_id, now, row)`:
+`ChatRepo::insert_event_message(instance_id, session_id, now, row)`:
 
 ```sql
 INSERT INTO engine.chat_messages (…)
@@ -199,7 +201,7 @@ Two concurrent draws under different keys can both pass the `NOT EXISTS`
 under READ COMMITTED and both land. This millisecond window is accepted, as
 it is for `/open`.
 
-### 5.5 Migration `0070_chat_messages_event_key.sql`
+### 5.5 Migration `0071_chat_messages_event_key.sql`
 
 ```sql
 CREATE UNIQUE INDEX chat_messages_event_key_uidx
@@ -213,12 +215,13 @@ FK work. Building it scans `chat_messages`, as `0064` did.
 
 ## 6. While it lasts
 
-`ChatRepo::current_event(instance_id, at)` returns the instance's event row
-with `sent_at ≤ at < ends_at`, if any. On a text turn, `at` is the turn's
-user-row `sent_at`, so a re-driven turn sees the same event.
+`ChatRepo::current_event(instance_id, at_message, now)` returns the instance's
+event under way at `at_message`'s `sent_at`, or at `now` without one: the
+event row with `sent_at ≤ at < ends_at`, if any. On a text turn, `at_message`
+is the turn's user row, so a re-driven turn sees the same event.
 
-- **Judge.** `build_pde_ctx` gains `event: Option<&EventView>` and, when
-  present, renders after `[需求]` and before `[身体状态]`:
+- **Judge.** `build_pde_ctx` gains `event: Option<&str>` (the rendered text)
+  and, when present, renders after `[需求]` and before `[身体状态]`:
 
   ```
   [近期事件] 临时接到工作（1 小时前开始，约 3 小时后结束）
@@ -262,7 +265,7 @@ that opens on a conversation can show it without having made the draw.
 |---|---|
 | `EventKind`, the kind table, `draw`, `duration` | `core/src/events.rs` (new), `core/src/lib.rs` |
 | `insert_event_message`, `event_message`, `recent_events`, `current_event` | `store/src/chat.rs` |
-| migration | `store/migrations/0070_chat_messages_event_key.sql` |
+| migration | `store/migrations/0071_chat_messages_event_key.sql` |
 | `Occasion::Event`, its cue and metadata | `server/src/pipeline/proactive.rs` |
 | the route, `EventView` | `server/src/routes/session_events.rs` (new), `routes/mod.rs` |
 | `[近期事件]` line | `server/src/pipeline/stream.rs` |
