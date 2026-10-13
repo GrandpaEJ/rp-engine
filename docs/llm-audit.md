@@ -169,10 +169,12 @@ call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 
 ### Reading it
 
-`usage` is stored **unfiltered** — whatever the provider sent, `cost`
-included when the provider sent one. `OPENROUTER_USAGE_HIDDEN_KEYS` strips
-keys only on the way out to clients (see above); the database has always kept
-the whole object and continues to.
+`usage` is stored **unfiltered** — for a non-streamed call, whatever the
+provider sent, `cost` included when the provider sent one. A streamed task
+(the chat reply, the group director, `pde_decision`) stores the parsed usage
+block only: prompt, completion and total tokens, and cost.
+`OPENROUTER_USAGE_HIDDEN_KEYS` strips keys only on the way out to clients (see
+above); it does not touch what the database keeps.
 
 Cost per task for a window. **Never sum `cost` without also counting how many
 rows carried one:**
@@ -196,9 +198,9 @@ The `model` filter drops BYOK hops, whose cost the end user paid; the
 `usage ? 'cost'` is the obvious spelling and is wrong twice: a `"cost": null`
 counts as priced while adding nothing to the sum, and a non-numeric value —
 `"cost": "unknown"`, or an object — makes `::numeric` **raise** and abort the
-query instead of yielding `NULL`. `usage` is stored verbatim from the
-provider's response and the engine does not validate its shape, so the query
-has to. `jsonb_typeof(usage->'cost') = 'number'` is false for a JSON null, a
+query instead of yielding `NULL`. `usage` is stored as the provider's response gave it (a streamed task
+stores its parsed usage block) and the engine does not validate its shape, so
+the query has to. `jsonb_typeof(usage->'cost') = 'number'` is false for a JSON null, a
 non-number, a missing key, and a `NULL` `usage` alike.
 
 **`cost` is a provider-dependent key.** OpenRouter returns it inside `usage`;
@@ -769,6 +771,20 @@ Written even when the describe never ran — `not_configured`, `attempts = 0`
 — because that is one of three reasons `chat_messages.metadata.vision` can be
 absent on a turn, and this is the only way to tell it apart from "the
 describe ran and failed on every chain model" (`exhausted`).
+
+### PDE judge payload
+
+`companion_decision_events.payload` of a judge run, by outcome:
+
+| Outcome | `payload` |
+|---|---|
+| Parsed verdict | The verdict object plus `"reasoning"`: the full reasoning text, or `null` when the model returned none |
+| Unparseable content, no reasoning | The raw content string |
+| Unparseable content, with reasoning | `{"raw": "…", "reasoning": "…"}` |
+| No content (failures only), with reasoning | `{"reasoning": "…"}` |
+| No content, no reasoning | NULL |
+
+When the call falls back to another model, the reasoning of every attempt is kept, concatenated. A judge that streams reasoning but no content falls back to the rule engine; its row has status `empty` and `{"reasoning": "…"}`. The reasoning is the replay corpus for tuning the judge's `filter_prompt`.
 
 ## Group director
 

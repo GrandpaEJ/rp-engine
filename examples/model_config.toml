@@ -72,7 +72,7 @@ tasks  = ["chat_companion"]
 params = { reasoning = { enabled = false } }
 #
 # The group director reasons before it casts a group turn; the reasoning
-# streams to the client as `director_reasoning` frames. Reasoning tokens count
+# streams to the client as `reasoning` frames. Reasoning tokens count
 # against the task's `max_tokens`, so cap reasoning here (`effort` or
 # `reasoning.max_tokens`) rather than by lowering `max_tokens`.
 [[providers.openrouter.body]]
@@ -86,6 +86,17 @@ params = { reasoning = { effort = "medium" } }
 #[[providers.openrouter.body]]
 #tasks  = ["chat_vision"]
 #params = { reasoning_effort = "none" }
+#
+# Judge reasoning (optional). The PDE judge streams, and whatever reasoning its
+# model returns reaches the 1:1 client as `reasoning` frames ahead of the reply
+# and is kept on the decision audit row. This rule turns reasoning on;
+# `reasoning = { enabled = false }` or `{ exclude = true }` turns it off.
+# Reasoning tokens count against the task's
+# `max_tokens`, and the reply waits for the judge — raise
+# `[tasks.pde_decision].max_tokens` and `timeout_secs` together with it.
+#[[providers.openrouter.body]]
+#tasks  = ["pde_decision"]
+#params = { reasoning = { effort = "low" } }
 #
 # OpenRouter routing prefs (the former [defaults].ignore_providers /
 # provider_sort) are now body params on the reserved openrouter entry —
@@ -722,6 +733,7 @@ temperature = 0.3
 max_tokens  = 400
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
+#timeout_secs = 15         # per-attempt limit, opening through finishing the read; raise it when reasoning is on
 # Uncomment filter_prompt to enable the LLM judge. inner_state / clothing MUST be
 # short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
